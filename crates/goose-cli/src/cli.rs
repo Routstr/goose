@@ -743,6 +743,7 @@ pub async fn cli() -> Result<()> {
         Some(Command::Bench { .. }) => "bench",
         Some(Command::Recipe { .. }) => "recipe",
         Some(Command::Web { .. }) => "web",
+        Some(Command::Wallet { .. }) => "wallet",
         None => "default_session",
     };
 
