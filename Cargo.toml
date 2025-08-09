@@ -20,4 +20,3 @@ chrono = { version = "0.4.38", features = ["serde"] }
 # Patch for Windows cross-compilation issue with crunchy
 [patch.crates-io]
 crunchy = { git = "https://github.com/nmathewson/crunchy", branch = "cross-compilation-fix" }
-chrono = "0.4.38"
