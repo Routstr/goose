@@ -13,8 +13,8 @@ use crate::conversation::message::Message;
 use crate::impl_provider_default;
 use crate::model::ModelConfig;
 use crate::providers::utils::{
-    emit_debug_trace, get_model, handle_response_openai_compat,
-    is_anthropic_model, update_request_for_anthropic, ImageFormat,
+    emit_debug_trace, get_model, handle_response_openai_compat, is_anthropic_model,
+    update_request_for_anthropic, ImageFormat,
 };
 use rmcp::model::Tool;
 

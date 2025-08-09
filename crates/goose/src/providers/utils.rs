@@ -108,7 +108,7 @@ pub fn map_http_error_to_provider_error(
             tracing::debug!(
                 "Provider request failed with status: {}. Payload: {:?}", status, payload
             );
-            
+
             if let Some(payload) = payload {
                 // Try to parse as OpenAIErrorResponse first for better error handling
                 if let Ok(err_resp) = from_value::<OpenAIErrorResponse>(payload.clone()) {
@@ -121,13 +121,13 @@ pub fn map_http_error_to_provider_error(
                     }
                     return ProviderError::RequestFailed(format!("{} (status {})", err, status.as_u16()));
                 }
-                
+
                 // Fallback to simple payload string check
                 let payload_str = payload.to_string();
                 if check_context_length_exceeded(&payload_str) {
                     return ProviderError::ContextLengthExceeded(payload_str);
                 }
-                
+
                 // Try to extract error message from generic error structure
                 if let Some(error) = payload.get("error") {
                     if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
@@ -135,7 +135,7 @@ pub fn map_http_error_to_provider_error(
                     }
                 }
             }
-            
+
             ProviderError::RequestFailed(format!("Request failed with status: {}", status))
         }
         StatusCode::TOO_MANY_REQUESTS => {
