@@ -14,7 +14,7 @@ const inkeepOrgId = process.env.INKEEP_ORG_ID;
 const config: Config = {
   title: "codename goose",
   tagline:
-    "Your local AI agent, automating engineering tasks seamlessly.",
+    "your local AI agent, automating engineering tasks seamlessly.",
   favicon: "img/favicon.ico",
 
   // Set the production url of your site here
@@ -65,10 +65,15 @@ const config: Config = {
             "./src/css/tailwind.css",
           ],
         },
+        gtag: process.env.NODE_ENV === 'production' ? {
+          trackingID: 'G-ZS5D6SB4ZJ',
+          anonymizeIP: true,
+        } : undefined,
       } satisfies Preset.Options,
     ],
   ],
   plugins: [
+    require.resolve("./plugins/custom-webpack.cjs"),
     [
       "@docusaurus/plugin-client-redirects",
       {
@@ -107,7 +112,31 @@ const config: Config = {
           },
           {
             from: '/docs/guides/share-goose-sessions',
-            to: '/docs/guides/session-recipes'
+            to: '/docs/guides/recipes/session-recipes'
+          },
+          {
+            from: '/docs/guides/session-recipes',
+            to: '/docs/guides/recipes/session-recipes'
+          },
+          {
+            from: '/docs/guides/recipe-reference',
+            to: '/docs/guides/recipes/recipe-reference'
+          },
+          {
+            from: '/docs/guides/tool-permissions',
+            to: '/docs/guides/managing-tools/tool-permissions'
+          },
+          {
+            from: '/docs/guides/adjust-tool-output',
+            to: '/docs/guides/managing-tools/adjust-tool-output'
+          },
+          {
+            from: '/docs/guides/benchmarking',
+            to: '/docs/tutorials/benchmarking'
+          },
+          {
+            from: '/docs/guides/goose-in-docker',
+            to: '/docs/tutorials/goose-in-docker'
           },
           // MCP tutorial redirects - moved from /docs/tutorials/ to /docs/mcp/
           {
@@ -240,7 +269,7 @@ const config: Config = {
           },
           {
             from: '/docs/tutorials/vscode-mcp',
-            to: '/docs/mcp/vscode-mcp'
+            to: '/docs/mcp/vs-code-mcp'
           },
           {
             from: '/docs/tutorials/youtube-transcript',
@@ -259,6 +288,9 @@ const config: Config = {
   themeConfig: {
     // Replace with your project's social card
     image: "img/home-banner.png",
+    colorMode: {
+      respectPrefersColorScheme: true
+    },
     navbar: {
       title: "",
       logo: {
@@ -281,6 +313,11 @@ const config: Config = {
           to: "/docs/category/tutorials",
           position: "left",
           label: "Tutorials",
+        },
+        {
+          to: "/docs/category/mcp-servers",
+          position: "left",
+          label: "MCPs",
         },
         { to: "/blog", label: "Blog", position: "left" },
         {
@@ -414,7 +451,16 @@ const config: Config = {
         quickQuestions: ["What is Goose?"],
       },
     },
+    announcementBar: {
+      id: 'goose-grants',
+      content:
+        '✨ goose grant program now open: <a href="/goose/grants">apply now</a>! ✨',
+      backgroundColor: '#20232a',
+      textColor: '#fff',
+      isCloseable: false,
+    },
   } satisfies Preset.ThemeConfig,
 };
+
 
 export default config;

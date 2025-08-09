@@ -26,17 +26,23 @@ pub enum ProviderError {
 
     #[error("Insufficient balance: {0} sats required. Please top up your balance to continue.")]
     InsufficientBalance(f64),
+
+    #[error("Unsupported operation: {0}")]
+    NotImplemented(String),
 }
 
 impl From<anyhow::Error> for ProviderError {
     fn from(error: anyhow::Error) -> Self {
+        if let Some(reqwest_err) = error.downcast_ref::<reqwest::Error>() {
+            return ProviderError::RequestFailed(reqwest_err.to_string());
+        }
         ProviderError::ExecutionError(error.to_string())
     }
 }
 
 impl From<reqwest::Error> for ProviderError {
     fn from(error: reqwest::Error) -> Self {
-        ProviderError::ExecutionError(error.to_string())
+        ProviderError::RequestFailed(error.to_string())
     }
 }
 

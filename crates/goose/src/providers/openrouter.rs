@@ -1,20 +1,20 @@
 use anyhow::{Error, Result};
 use async_trait::async_trait;
-use reqwest::Client;
-use serde_json::Value;
-use std::time::Duration;
+use serde_json::{json, Value};
 
+use super::api_client::{ApiClient, AuthMethod};
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
-use crate::message::Message;
+use super::retry::ProviderRetry;
+use super::utils::{
+    emit_debug_trace, get_model, handle_response_google_compat, handle_response_openai_compat,
+    is_google_model, is_anthropic_model, update_request_for_anthropic,
+};
+use crate::conversation::message::Message;
+use crate::impl_provider_default;
 use crate::model::ModelConfig;
 use crate::providers::formats::openai::{create_request, get_usage, response_to_message};
-use crate::providers::utils::{
-    emit_debug_trace, get_model, handle_provider_response, is_anthropic_model, is_google_model,
-    update_request_for_anthropic, ProviderResponseType,
-};
-use mcp_core::tool::Tool;
-use url::Url;
+use rmcp::model::Tool;
 
 pub const OPENROUTER_DEFAULT_MODEL: &str = "anthropic/claude-3.5-sonnet";
 pub const OPENROUTER_MODEL_PREFIX_ANTHROPIC: &str = "anthropic";
@@ -26,24 +26,19 @@ pub const OPENROUTER_KNOWN_MODELS: &[&str] = &[
     "anthropic/claude-sonnet-4",
     "google/gemini-2.5-pro",
     "deepseek/deepseek-r1-0528",
+    "qwen/qwen3-coder",
+    "moonshotai/kimi-k2",
 ];
 pub const OPENROUTER_DOC_URL: &str = "https://openrouter.ai/models";
 
 #[derive(serde::Serialize)]
 pub struct OpenRouterProvider {
     #[serde(skip)]
-    client: Client,
-    host: String,
-    api_key: String,
+    api_client: ApiClient,
     model: ModelConfig,
 }
 
-impl Default for OpenRouterProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(OpenRouterProvider::metadata().default_model);
-        OpenRouterProvider::from_env(model).expect("Failed to initialize OpenRouter provider")
-    }
-}
+impl_provider_default!(OpenRouterProvider);
 
 impl OpenRouterProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -53,46 +48,34 @@ impl OpenRouterProvider {
             .get_param("OPENROUTER_HOST")
             .unwrap_or_else(|_| "https://openrouter.ai".to_string());
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let auth = AuthMethod::BearerToken(api_key);
+        let api_client = ApiClient::new(host, auth)?
+            .with_header("HTTP-Referer", "https://block.github.io/goose")?
+            .with_header("X-Title", "Goose")?;
 
-        Ok(Self {
-            client,
-            host,
-            api_key,
-            model,
-        })
+        Ok(Self { api_client, model })
     }
 
-    async fn post(&self, payload: Value) -> Result<Value, ProviderError> {
-        println!("{payload}");
-        let base_url = Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let url = base_url.join("api/v1/chat/completions").map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
-        })?;
-
+    async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
         let response = self
-            .client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("HTTP-Referer", "https://block.github.io/goose")
-            .header("X-Title", "Goose")
-            .json(&payload)
-            .send()
+            .api_client
+            .response_post("api/v1/chat/completions", payload)
             .await?;
 
-        // Determine the provider type based on the model
-        let provider_type = if is_google_model(&payload) {
-            ProviderResponseType::Google
-        } else {
-            ProviderResponseType::OpenAI
-        };
+        // Handle Google-compatible model responses differently
+        if is_google_model(payload) {
+            return handle_response_google_compat(response).await;
+        }
 
-        // Handle response based on provider type
-        let response_value = handle_provider_response(response, provider_type).await?;
+        // Handle regular OpenAI-compatible responses
+        let response_value = handle_response_openai_compat(response).await?;
+
+        let _debug = format!(
+            "OpenRouter request with payload: {} and response: {}",
+            serde_json::to_string_pretty(payload).unwrap_or_else(|_| "Invalid JSON".to_string()),
+            serde_json::to_string_pretty(&response_value)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
+        );
 
         // OpenRouter can return errors in 200 OK responses, so we have to check for errors explicitly
         // https://openrouter.ai/docs/api-reference/errors
@@ -112,6 +95,20 @@ impl OpenRouterProvider {
                 ));
             }
 
+            // Check for insufficient balance errors
+            if error_code == 402 || error_message.contains("insufficient_balance") {
+                // Try to extract required sats from error message
+                if let Some(sats_str) = error_message
+                    .split_whitespace()
+                    .find(|word| word.parse::<f64>().is_ok())
+                {
+                    if let Ok(sats) = sats_str.parse::<f64>() {
+                        return Err(ProviderError::InsufficientBalance(sats));
+                    }
+                }
+                return Err(ProviderError::InsufficientBalance(0.0));
+            }
+
             // Return appropriate error based on the OpenRouter error code
             match error_code {
                 401 | 403 => return Err(ProviderError::Authentication(error_message.to_string())),
@@ -126,13 +123,13 @@ impl OpenRouterProvider {
 }
 
 fn create_request_based_on_model(
-    model_config: &ModelConfig,
+    provider: &OpenRouterProvider,
     system: &str,
     messages: &[Message],
     tools: &[Tool],
 ) -> anyhow::Result<Value, Error> {
     let mut payload = create_request(
-        model_config,
+        &provider.model,
         system,
         messages,
         tools,
@@ -140,9 +137,15 @@ fn create_request_based_on_model(
     )?;
 
     // Apply anthropic-specific modifications if needed
-    if is_anthropic_model(&model_config.model_name) {
+    if provider.supports_cache_control() {
         payload = update_request_for_anthropic(&payload);
     }
+
+    // Always add transforms: ["middle-out"] for OpenRouter to handle prompts > context size
+    payload
+        .as_object_mut()
+        .unwrap()
+        .insert("transforms".to_string(), json!(["middle-out"]));
 
     Ok(payload)
 }
@@ -184,23 +187,107 @@ impl Provider for OpenRouterProvider {
         tools: &[Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         // Create the base payload
-        let payload = create_request_based_on_model(&self.model, system, messages, tools)?;
+        let payload = create_request_based_on_model(self, system, messages, tools)?;
 
         // Make request
-        let response = self.post(payload.clone()).await?;
+        let response = self
+            .with_retry(|| async {
+                let payload_clone = payload.clone();
+                self.post(&payload_clone).await
+            })
+            .await?;
 
         // Parse response
-        let message = response_to_message(response.clone())?;
-        let usage = match get_usage(&response) {
-            Ok(usage) => usage,
-            Err(ProviderError::UsageError(e)) => {
-                tracing::debug!("Failed to get usage data: {}", e);
-                Usage::default()
-            }
-            Err(e) => return Err(e),
-        };
+        let message = response_to_message(&response)?;
+        let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
+            tracing::debug!("Failed to get usage data");
+            Usage::default()
+        });
         let model = get_model(&response);
         emit_debug_trace(&self.model, &payload, &response, &usage);
         Ok((message, ProviderUsage::new(model, usage)))
+    }
+
+    /// Fetch supported models from OpenRouter API (only models with tool support)
+    async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        // Handle request failures gracefully
+        // If the request fails, fall back to manual entry
+        let response = match self.api_client.response_get("api/v1/models").await {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::warn!("Failed to fetch models from OpenRouter API: {}, falling back to manual model entry", e);
+                return Ok(None);
+            }
+        };
+
+        // Handle JSON parsing failures gracefully
+        let json: serde_json::Value = match response.json().await {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!("Failed to parse OpenRouter API response as JSON: {}, falling back to manual model entry", e);
+                return Ok(None);
+            }
+        };
+
+        // Check for error in response
+        if let Some(err_obj) = json.get("error") {
+            let msg = err_obj
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            tracing::warn!("OpenRouter API returned an error: {}", msg);
+            return Ok(None);
+        }
+
+        let data = json.get("data").and_then(|v| v.as_array()).ok_or_else(|| {
+            ProviderError::UsageError("Missing data field in JSON response".into())
+        })?;
+
+        let mut models: Vec<String> = data
+            .iter()
+            .filter_map(|model| {
+                // Get the model ID
+                let id = model.get("id").and_then(|v| v.as_str())?;
+
+                // Check if the model supports tools
+                let supported_params =
+                    match model.get("supported_parameters").and_then(|v| v.as_array()) {
+                        Some(params) => params,
+                        None => {
+                            // If supported_parameters is missing, skip this model (assume no tool support)
+                            tracing::debug!(
+                                "Model '{}' missing supported_parameters field, skipping",
+                                id
+                            );
+                            return None;
+                        }
+                    };
+
+                let has_tool_support = supported_params
+                    .iter()
+                    .any(|param| param.as_str() == Some("tools"));
+
+                if has_tool_support {
+                    Some(id.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // If no models with tool support were found, fall back to manual entry
+        if models.is_empty() {
+            tracing::warn!("No models with tool support found in OpenRouter API response, falling back to manual model entry");
+            return Ok(None);
+        }
+
+        models.sort();
+        Ok(Some(models))
+    }
+
+    fn supports_cache_control(&self) -> bool {
+        self.model
+            .model_name
+            .starts_with(OPENROUTER_MODEL_PREFIX_ANTHROPIC)
     }
 }

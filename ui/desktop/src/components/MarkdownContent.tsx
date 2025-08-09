@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Check, Copy } from './icons';
+import { wrapHTMLInCodeBlock } from '../utils/htmlSecurity';
 
 interface CodeProps extends React.ClassAttributes<HTMLElement>, React.HTMLAttributes<HTMLElement> {
   inline?: boolean;
@@ -76,58 +77,39 @@ const MarkdownCode = React.forwardRef(function MarkdownCode(
   );
 });
 
-// Detect if content contains HTML
-const containsHTML = (str: string) => {
-  const htmlRegex = /<[^>]*>/;
-  return htmlRegex.test(str);
-};
-
-// Wrap HTML content in code blocks
-const wrapHTMLInCodeBlock = (content: string) => {
-  if (containsHTML(content)) {
-    // Split content by code blocks to preserve existing ones
-    const parts = content.split(/(```[\s\S]*?```)/g);
-    return parts
-      .map((part) => {
-        // If part is already a code block, leave it as is
-        if (part.startsWith('```') && part.endsWith('```')) {
-          return part;
-        }
-        // If part contains HTML, wrap it in HTML code block
-        if (containsHTML(part)) {
-          return `\`\`\`html\n${part}\n\`\`\``;
-        }
-        return part;
-      })
-      .join('\n');
-  }
-  return content;
-};
-
 export default function MarkdownContent({ content, className = '' }: MarkdownContentProps) {
-  // Process content before rendering
-  const processedContent = wrapHTMLInCodeBlock(content);
+  const [processedContent, setProcessedContent] = useState(content);
+
+  useEffect(() => {
+    try {
+      const processed = wrapHTMLInCodeBlock(content);
+      setProcessedContent(processed);
+    } catch (error) {
+      console.error('Error processing content:', error);
+      // Fallback to original content if processing fails
+      setProcessedContent(content);
+    }
+  }, [content]);
 
   return (
     <div className="w-full overflow-x-hidden">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        className={`prose prose-sm text-textStandard dark:prose-invert w-full max-w-full word-break
+        className={`prose prose-sm text-text-default dark:prose-invert w-full max-w-full word-break
           prose-pre:p-0 prose-pre:m-0 !p-0
           prose-code:break-all prose-code:whitespace-pre-wrap
           prose-table:table prose-table:w-full
           prose-blockquote:text-inherit
-          prose-td:border prose-td:border-borderSubtle prose-td:p-2
-          prose-th:border prose-th:border-borderSubtle prose-th:p-2
-          prose-thead:bg-bgSubtle
-          prose-h1:text-2xl prose-h1:font-medium prose-h1:mb-5 prose-h1:mt-5
-          prose-h2:text-xl prose-h2:font-medium prose-h2:mb-4 prose-h2:mt-4
-          prose-h3:text-lg prose-h3:font-medium prose-h3:mb-3 prose-h3:mt-3
+          prose-td:border prose-td:border-border-default prose-td:p-2
+          prose-th:border prose-th:border-border-default prose-th:p-2
+          prose-thead:bg-background-default
+          prose-h1:text-2xl prose-h1:font-normal prose-h1:mb-5 prose-h1:mt-0
+          prose-h2:text-xl prose-h2:font-normal prose-h2:mb-4 prose-h2:mt-4
+          prose-h3:text-lg prose-h3:font-normal prose-h3:mb-3 prose-h3:mt-3
           prose-p:mt-0 prose-p:mb-2
           prose-ol:my-2
           prose-ul:mt-0 prose-ul:mb-3
           prose-li:m-0
-
           ${className}`}
         components={{
           a: ({ ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,

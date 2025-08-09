@@ -1,5 +1,6 @@
-import { getApiUrl, getSecretKey } from './config';
+import { getApiUrl } from './config';
 import { toast } from 'react-toastify';
+import { safeJsonParse } from './utils/jsonUtils';
 
 import builtInExtensionsData from './built-in-extensions.json';
 import { toastError, toastLoading, toastSuccess } from './toasts';
@@ -15,6 +16,14 @@ export type ExtensionConfig =
       name: string;
       uri: string;
       env_keys?: string[];
+      timeout?: number;
+    }
+  | {
+      type: 'streamable_http';
+      name: string;
+      uri: string;
+      env_keys?: string[];
+      headers?: Record<string, string>;
       timeout?: number;
     }
   | {
@@ -73,6 +82,10 @@ export async function addExtension(
         name: sanitizeName(extension.name),
         uri: extension.uri,
       }),
+      ...(extension.type === 'streamable_http' && {
+        name: sanitizeName(extension.name),
+        uri: extension.uri,
+      }),
       ...(extension.type === 'builtin' && {
         name: sanitizeName(extension.name),
       }),
@@ -87,7 +100,7 @@ export async function addExtension(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Secret-Key': getSecretKey(),
+        'X-Secret-Key': await window.electron.getSecretKey(),
       },
       body: JSON.stringify(config),
     });
@@ -164,12 +177,12 @@ export async function removeExtension(name: string, silent: boolean = false): Pr
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Secret-Key': getSecretKey(),
+        'X-Secret-Key': await window.electron.getSecretKey(),
       },
       body: JSON.stringify(sanitizeName(name)),
     });
 
-    const data = await response.json();
+    const data = await safeJsonParse<{ error: boolean; message: string }>(response);
 
     if (!data.error) {
       if (!silent) {
@@ -262,6 +275,7 @@ export async function replaceWithShims(cmd: string) {
     jbang: await window.electron.getBinaryPath('jbang'),
     npx: await window.electron.getBinaryPath('npx'),
     uvx: await window.electron.getBinaryPath('uvx'),
+    'npx.cmd': await window.electron.getBinaryPath('npx.cmd'),
   };
 
   if (binaryPathMap[cmd]) {

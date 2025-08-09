@@ -1,8 +1,9 @@
 use crate::session::message_to_markdown;
 use anyhow::{Context, Result};
 use cliclack::{confirm, multiselect, select};
-use goose::session::info::{get_session_info, SessionInfo, SortOrder};
+use goose::session::info::{get_valid_sorted_sessions, SessionInfo, SortOrder};
 use goose::session::{self, Identifier};
+use goose::utils::safe_truncate;
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,11 +51,7 @@ fn prompt_interactive_session_removal(sessions: &[SessionInfo]) -> Result<Vec<Se
             } else {
                 &s.metadata.description
             };
-            let truncated_desc = if desc.len() > TRUNCATED_DESC_LENGTH {
-                format!("{}...", &desc[..TRUNCATED_DESC_LENGTH - 3])
-            } else {
-                desc.to_string()
-            };
+            let truncated_desc = safe_truncate(desc, TRUNCATED_DESC_LENGTH);
             let display_text = format!("{} - {} ({})", s.modified, truncated_desc, s.id);
             (display_text, s.clone())
         })
@@ -75,7 +72,7 @@ fn prompt_interactive_session_removal(sessions: &[SessionInfo]) -> Result<Vec<Se
 }
 
 pub fn handle_session_remove(id: Option<String>, regex_string: Option<String>) -> Result<()> {
-    let all_sessions = match get_session_info(SortOrder::Descending) {
+    let all_sessions = match get_valid_sorted_sessions(SortOrder::Descending) {
         Ok(sessions) => sessions,
         Err(e) => {
             tracing::error!("Failed to retrieve sessions: {:?}", e);
@@ -125,7 +122,7 @@ pub fn handle_session_list(verbose: bool, format: String, ascending: bool) -> Re
         SortOrder::Descending
     };
 
-    let sessions = match get_session_info(sort_order) {
+    let sessions = match get_valid_sorted_sessions(sort_order) {
         Ok(sessions) => sessions,
         Err(e) => {
             tracing::error!("Failed to list sessions: {:?}", e);
@@ -175,7 +172,12 @@ pub fn handle_session_list(verbose: bool, format: String, ascending: bool) -> Re
 /// without creating an Agent or prompting about working directories.
 pub fn handle_session_export(identifier: Identifier, output_path: Option<PathBuf>) -> Result<()> {
     // Get the session file path
-    let session_file_path = goose::session::get_path(identifier.clone());
+    let session_file_path = match goose::session::get_path(identifier.clone()) {
+        Ok(path) => path,
+        Err(e) => {
+            return Err(anyhow::anyhow!("Invalid session identifier: {}", e));
+        }
+    };
 
     if !session_file_path.exists() {
         return Err(anyhow::anyhow!(
@@ -193,7 +195,8 @@ pub fn handle_session_export(identifier: Identifier, output_path: Option<PathBuf
     };
 
     // Generate the markdown content using the export functionality
-    let markdown = export_session_to_markdown(messages, &session_file_path, None);
+    let markdown =
+        export_session_to_markdown(messages.messages().clone(), &session_file_path, None);
 
     // Output the markdown
     if let Some(output) = output_path {
@@ -212,7 +215,7 @@ pub fn handle_session_export(identifier: Identifier, output_path: Option<PathBuf
 /// This function handles the formatting of a complete session including headers,
 /// message organization, and proper tool request/response pairing.
 fn export_session_to_markdown(
-    messages: Vec<goose::message::Message>,
+    messages: Vec<goose::conversation::message::Message>,
     session_file: &Path,
     session_name_override: Option<&str>,
 ) -> String {
@@ -239,11 +242,13 @@ fn export_session_to_markdown(
 
     for message in &messages {
         // Check if this is a User message containing only ToolResponses
-        let is_only_tool_response = message.role == mcp_core::role::Role::User
-            && message
-                .content
-                .iter()
-                .all(|content| matches!(content, goose::message::MessageContent::ToolResponse(_)));
+        let is_only_tool_response = message.role == rmcp::model::Role::User
+            && message.content.iter().all(|content| {
+                matches!(
+                    content,
+                    goose::conversation::message::MessageContent::ToolResponse(_)
+                )
+            });
 
         // If the previous message had tool requests and this one is just tool responses,
         // don't create a new User section - we'll attach the responses to the tool calls
@@ -261,8 +266,8 @@ fn export_session_to_markdown(
         // Output the role prefix except for tool response-only messages
         if !is_only_tool_response {
             let role_prefix = match message.role {
-                mcp_core::role::Role::User => "### User:\n",
-                mcp_core::role::Role::Assistant => "### Assistant:\n",
+                rmcp::model::Role::User => "### User:\n",
+                rmcp::model::Role::Assistant => "### Assistant:\n",
             };
             markdown_output.push_str(role_prefix);
         }
@@ -272,11 +277,12 @@ fn export_session_to_markdown(
         markdown_output.push_str("\n\n---\n\n");
 
         // Check if this message has any tool requests, to handle the next message differently
-        if message
-            .content
-            .iter()
-            .any(|content| matches!(content, goose::message::MessageContent::ToolRequest(_)))
-        {
+        if message.content.iter().any(|content| {
+            matches!(
+                content,
+                goose::conversation::message::MessageContent::ToolRequest(_)
+            )
+        }) {
             skip_next_if_tool_response = true;
         }
     }
@@ -289,7 +295,7 @@ fn export_session_to_markdown(
 /// Shows a list of available sessions and lets the user select one
 pub fn prompt_interactive_session_selection() -> Result<session::Identifier> {
     // Get sessions sorted by modification date (newest first)
-    let sessions = match get_session_info(SortOrder::Descending) {
+    let sessions = match get_valid_sorted_sessions(SortOrder::Descending) {
         Ok(sessions) => sessions,
         Err(e) => {
             tracing::error!("Failed to list sessions: {:?}", e);
@@ -315,11 +321,7 @@ pub fn prompt_interactive_session_selection() -> Result<session::Identifier> {
             };
 
             // Truncate description if too long
-            let truncated_desc = if desc.len() > 40 {
-                format!("{}...", &desc[..37])
-            } else {
-                desc.to_string()
-            };
+            let truncated_desc = safe_truncate(desc, 40);
 
             let display_text = format!("{} - {} ({})", s.modified, truncated_desc, s.id);
             (display_text, s.clone())

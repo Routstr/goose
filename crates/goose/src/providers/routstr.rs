@@ -9,13 +9,14 @@ use std::time::Duration;
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
 use super::formats::openai::{create_request, get_usage, response_to_message};
-use crate::message::Message;
+use crate::conversation::message::Message;
+use crate::impl_provider_default;
 use crate::model::ModelConfig;
 use crate::providers::utils::{
-    emit_debug_trace, get_model, handle_provider_response, is_anthropic_model,
-    update_request_for_anthropic, ImageFormat, ProviderResponseType,
+    emit_debug_trace, get_model, handle_response_google_compat, handle_response_openai_compat,
+    is_anthropic_model, is_google_model, update_request_for_anthropic, ImageFormat,
 };
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 
 pub const ROUTSTR_HOST: &str = "https://api.routstr.com";
 pub const ROUTSTR_DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4";
@@ -76,14 +77,7 @@ pub struct RoutstrProvider {
     api_key: String,
 }
 
-impl Default for RoutstrProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(RoutstrProvider::metadata().default_model).with_toolshim(true);
-        // For the default implementation, we'll create a provider without pricing information
-        // The pricing will be fetched lazily when needed
-        Self::from_env(model).expect("Failed to initialize Routstr provider")
-    }
-}
+impl_provider_default!(RoutstrProvider);
 
 impl RoutstrProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -125,7 +119,7 @@ impl RoutstrProvider {
             .send()
             .await?;
 
-        handle_provider_response(response, ProviderResponseType::OpenAI).await
+        handle_response_openai_compat(response).await
     }
 
     /// Get models

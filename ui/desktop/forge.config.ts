@@ -12,34 +12,28 @@ let cfg = {
     certificateFile: process.env.WINDOWS_CERTIFICATE_FILE,
     signingRole: process.env.WINDOW_SIGNING_ROLE,
     rfc3161TimeStampServer: 'http://timestamp.digicert.com',
-    signWithParams: '/fd sha256 /tr http://timestamp.digicert.com /td sha256'
+    signWithParams: '/fd sha256 /tr http://timestamp.digicert.com /td sha256',
   },
   // Protocol registration
   protocols: [
     {
-      name: "GooseProtocol",
-      schemes: ["goose"]
-    }
+      name: 'GooseProtocol',
+      schemes: ['goose'],
+    },
   ],
-  // macOS specific configuration
-  osxSign: {
-    entitlements: 'entitlements.plist',
-    'entitlements-inherit': 'entitlements.plist',
-    'gatekeeper-assess': false,
-    hardenedRuntime: true,
-    identity: 'Developer ID Application: Michael Neale (W2L75AE9HQ)',
+  // macOS Info.plist extensions for drag-and-drop support
+  extendInfo: {
+    // Document types for drag-and-drop support onto dock icon
+    CFBundleDocumentTypes: [
+      {
+        CFBundleTypeName: "Folders",
+        CFBundleTypeRole: "Viewer",
+        LSHandlerRank: "Alternate",
+        LSItemContentTypes: ["public.directory", "public.folder"]
+      }
+    ]
   },
-  osxNotarize: {
-    appleId: process.env['APPLE_ID'],
-    appleIdPassword: process.env['APPLE_ID_PASSWORD'],
-    teamId: process.env['APPLE_TEAM_ID']
-  },
-}
-
-if (process.env['APPLE_ID'] === undefined) {
-  delete cfg.osxNotarize;
-  delete cfg.osxSign;
-}
+};
 
 module.exports = {
   packagerConfig: cfg,
@@ -50,36 +44,42 @@ module.exports = {
       config: {
         repository: {
           owner: 'block',
-          name: 'goose'
+          name: 'goose',
         },
         prerelease: false,
-        draft: true
-      }
-    }
+        draft: true,
+      },
+    },
   ],
   makers: [
     {
       name: '@electron-forge/maker-zip',
-      platforms: ['darwin', 'win32'],
+      platforms: ['darwin', 'win32', 'linux'],
       config: {
         arch: process.env.ELECTRON_ARCH === 'x64' ? ['x64'] : ['arm64'],
         options: {
-          icon: 'src/images/icon.ico'
-        }
-      }
+          icon: process.platform === 'linux' ? 'src/images/icon.png' : 'src/images/icon.ico',
+        },
+      },
     },
     {
       name: '@electron-forge/maker-deb',
       config: {
         name: 'Goose',
-        bin: 'Goose'
+        bin: 'Goose',
+        maintainer: 'Block, Inc.',
+        homepage: 'https://block.github.io/goose/',
+        categories: ['Development']
       },
     },
     {
       name: '@electron-forge/maker-rpm',
       config: {
         name: 'Goose',
-        bin: 'Goose'
+        bin: 'Goose',
+        maintainer: 'Block, Inc.',
+        homepage: 'https://block.github.io/goose/',
+        categories: ['Development']
       },
     },
   ],
@@ -90,17 +90,17 @@ module.exports = {
         build: [
           {
             entry: 'src/main.ts',
-            config: 'vite.main.config.ts',
+            config: 'vite.main.config.mts',
           },
           {
             entry: 'src/preload.ts',
-            config: 'vite.preload.config.ts',
+            config: 'vite.preload.config.mts',
           },
         ],
         renderer: [
           {
             name: 'main_window',
-            config: 'vite.renderer.config.ts',
+            config: 'vite.renderer.config.mts',
           },
         ],
       },

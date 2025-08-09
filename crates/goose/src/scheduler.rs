@@ -15,7 +15,8 @@ use tokio_cron_scheduler::{job::JobId, Job, JobScheduler as TokioJobScheduler};
 use crate::agents::AgentEvent;
 use crate::agents::{Agent, SessionConfig};
 use crate::config::{self, Config};
-use crate::message::Message;
+use crate::conversation::message::Message;
+use crate::conversation::Conversation;
 use crate::providers::base::Provider as GooseProvider; // Alias to avoid conflict in test section
 use crate::providers::create;
 use crate::recipe::Recipe;
@@ -27,32 +28,39 @@ use crate::session::storage::SessionMetadata;
 type RunningTasksMap = HashMap<String, tokio::task::AbortHandle>;
 type JobsMap = HashMap<String, (JobId, ScheduledJob)>;
 
-/// Converts a 5-field cron expression to a 6-field expression by prepending "0" for seconds
-/// If the expression already has 6 fields, returns it unchanged
-/// If the expression is invalid, returns the original expression
-pub fn normalize_cron_expression(cron_expr: &str) -> String {
-    let fields: Vec<&str> = cron_expr.split_whitespace().collect();
+/// Normalize a cron string so that:
+/// 1. It is always in **quartz 7-field format** expected by Temporal
+///    (seconds minutes hours dom month dow year).
+/// 2. Five-field → prepend seconds `0` and append year `*`.
+///    Six-field  → append year `*`.
+/// 3. Everything else returned unchanged (with a warning).
+pub fn normalize_cron_expression(src: &str) -> String {
+    let mut parts: Vec<&str> = src.split_whitespace().collect();
 
-    match fields.len() {
+    match parts.len() {
         5 => {
-            // 5-field cron: minute hour day month weekday
-            // Convert to 6-field: second minute hour day month weekday
-            format!("0 {}", cron_expr)
+            // min hour dom mon dow  → 0 min hour dom mon dow *
+            parts.insert(0, "0");
+            parts.push("*");
         }
         6 => {
-            // Already 6-field, return as-is
-            cron_expr.to_string()
+            // sec min hour dom mon dow  → sec min hour dom mon dow *
+            parts.push("*");
+        }
+        7 => {
+            // already quartz – do nothing
         }
         _ => {
-            // Invalid number of fields, return original (will likely fail parsing later)
             tracing::warn!(
-                "Invalid cron expression '{}': expected 5 or 6 fields, got {}",
-                cron_expr,
-                fields.len()
+                "Unrecognised cron expression '{}': expected 5, 6 or 7 fields (got {}). Leaving unchanged.",
+                src,
+                parts.len()
             );
-            cron_expr.to_string()
+            return src.to_string();
         }
     }
+
+    parts.join(" ")
 }
 
 pub fn get_default_scheduler_storage_path() -> Result<PathBuf, io::Error> {
@@ -263,14 +271,23 @@ impl Scheduler {
 
         tracing::info!("Attempting to parse cron expression: '{}'", stored_job.cron);
         let normalized_cron = normalize_cron_expression(&stored_job.cron);
-        if normalized_cron != stored_job.cron {
+        // Convert from 7-field (Temporal format) to 6-field (tokio-cron-scheduler format)
+        let tokio_cron = {
+            let parts: Vec<&str> = normalized_cron.split_whitespace().collect();
+            if parts.len() == 7 {
+                parts[..6].join(" ")
+            } else {
+                normalized_cron.clone()
+            }
+        };
+        if tokio_cron != stored_job.cron {
             tracing::info!(
-                "Normalized cron expression from '{}' to '{}'",
+                "Converted cron expression from '{}' to '{}' for tokio-cron-scheduler",
                 stored_job.cron,
-                normalized_cron
+                tokio_cron
             );
         }
-        let cron_task = Job::new_async(&normalized_cron, move |_uuid, _l| {
+        let cron_task = Job::new_async(&tokio_cron, move |_uuid, _l| {
             let task_job_id = job_for_task.id.clone();
             let current_jobs_arc = jobs_arc_for_task.clone();
             let local_storage_path = storage_path_for_task.clone();
@@ -432,14 +449,23 @@ impl Scheduler {
                 job_to_load.cron
             );
             let normalized_cron = normalize_cron_expression(&job_to_load.cron);
-            if normalized_cron != job_to_load.cron {
+            // Convert from 7-field (Temporal format) to 6-field (tokio-cron-scheduler format)
+            let tokio_cron = {
+                let parts: Vec<&str> = normalized_cron.split_whitespace().collect();
+                if parts.len() == 7 {
+                    parts[..6].join(" ")
+                } else {
+                    normalized_cron.clone()
+                }
+            };
+            if tokio_cron != job_to_load.cron {
                 tracing::info!(
-                    "Normalized cron expression from '{}' to '{}'",
+                    "Converted cron expression from '{}' to '{}' for tokio-cron-scheduler",
                     job_to_load.cron,
-                    normalized_cron
+                    tokio_cron
                 );
             }
-            let cron_task = Job::new_async(&normalized_cron, move |_uuid, _l| {
+            let cron_task = Job::new_async(&tokio_cron, move |_uuid, _l| {
                 let task_job_id = job_for_task.id.clone();
                 let current_jobs_arc = jobs_arc_for_task.clone();
                 let local_storage_path = storage_path_for_task.clone();
@@ -803,14 +829,23 @@ impl Scheduler {
                     new_cron
                 );
                 let normalized_cron = normalize_cron_expression(&new_cron);
-                if normalized_cron != new_cron {
+                // Convert from 7-field (Temporal format) to 6-field (tokio-cron-scheduler format)
+                let tokio_cron = {
+                    let parts: Vec<&str> = normalized_cron.split_whitespace().collect();
+                    if parts.len() == 7 {
+                        parts[..6].join(" ")
+                    } else {
+                        normalized_cron.clone()
+                    }
+                };
+                if tokio_cron != new_cron {
                     tracing::info!(
-                        "Normalized cron expression from '{}' to '{}'",
+                        "Converted cron expression from '{}' to '{}' for tokio-cron-scheduler",
                         new_cron,
-                        normalized_cron
+                        tokio_cron
                     );
                 }
-                let cron_task = Job::new_async(&normalized_cron, move |_uuid, _l| {
+                let cron_task = Job::new_async(&tokio_cron, move |_uuid, _l| {
                     let task_job_id = job_for_task.id.clone();
                     let current_jobs_arc = jobs_arc_for_task.clone();
                     let local_storage_path = storage_path_for_task.clone();
@@ -1106,7 +1141,12 @@ async fn run_scheduled_job_internal(
                             .to_string(),
                 }),
             };
-        let model_config = crate::model::ModelConfig::new(model_name.clone());
+        let model_config =
+            crate::model::ModelConfig::new(model_name.as_str()).map_err(|e| JobExecutionError {
+                job_id: job.id.clone(),
+                error: format!("Model config error: {}", e),
+            })?;
+
         agent_provider = create(&provider_name, model_config).map_err(|e| JobExecutionError {
             job_id: job.id.clone(),
             error: format!(
@@ -1114,6 +1154,17 @@ async fn run_scheduled_job_internal(
                 provider_name, e
             ),
         })?;
+    }
+    if let Some(recipe_extensions) = recipe.extensions {
+        for extension in recipe_extensions {
+            agent
+                .add_extension(extension.clone())
+                .await
+                .map_err(|e| JobExecutionError {
+                    job_id: job.id.clone(),
+                    error: format!("Failed to add extension '{}': {}", extension.name(), e),
+                })?;
+        }
     }
 
     if let Err(e) = agent.update_provider(agent_provider).await {
@@ -1138,13 +1189,21 @@ async fn run_scheduled_job_internal(
         }
     }
 
-    let session_file_path = crate::session::storage::get_path(
+    let session_file_path = match crate::session::storage::get_path(
         crate::session::storage::Identifier::Name(session_id_for_return.clone()),
-    );
+    ) {
+        Ok(path) => path,
+        Err(e) => {
+            return Err(JobExecutionError {
+                job_id: job.id.clone(),
+                error: format!("Failed to get session file path: {}", e),
+            });
+        }
+    };
 
     if let Some(prompt_text) = recipe.prompt {
-        let mut all_session_messages: Vec<Message> =
-            vec![Message::user().with_text(prompt_text.clone())];
+        let mut all_session_messages =
+            Conversation::new_unvalidated(vec![Message::user().with_text(prompt_text.clone())]);
 
         let current_dir = match std::env::current_dir() {
             Ok(cd) => cd,
@@ -1161,10 +1220,16 @@ async fn run_scheduled_job_internal(
             working_dir: current_dir.clone(),
             schedule_id: Some(job.id.clone()),
             execution_mode: job.execution_mode.clone(),
+            max_turns: None,
+            retry_config: None,
         };
 
         match agent
-            .reply(&all_session_messages, Some(session_config.clone()))
+            .reply(
+                all_session_messages.clone(),
+                Some(session_config.clone()),
+                None,
+            )
             .await
         {
             Ok(mut stream) => {
@@ -1176,7 +1241,7 @@ async fn run_scheduled_job_internal(
 
                     match message_result {
                         Ok(AgentEvent::Message(msg)) => {
-                            if msg.role == mcp_core::role::Role::Assistant {
+                            if msg.role == rmcp::model::Role::Assistant {
                                 tracing::info!("[Job {}] Assistant: {:?}", job.id, msg.content);
                             }
                             all_session_messages.push(msg);
@@ -1186,6 +1251,9 @@ async fn run_scheduled_job_internal(
                         }
                         Ok(AgentEvent::ModelChange { .. }) => {
                             // Model change events are informational, just continue
+                        }
+                        Ok(AgentEvent::HistoryReplaced(_)) => {
+                            // Handle history replacement events if needed
                         }
                         Err(e) => {
                             tracing::error!(
@@ -1223,6 +1291,7 @@ async fn run_scheduled_job_internal(
                             working_dir: current_dir.clone(),
                             description: String::new(),
                             schedule_id: Some(job.id.clone()),
+                            project_id: None,
                             message_count: all_session_messages.len(),
                             total_tokens: None,
                             input_tokens: None,
@@ -1261,9 +1330,11 @@ async fn run_scheduled_job_internal(
             message_count: 0,
             ..Default::default()
         };
-        if let Err(e) =
-            crate::session::storage::save_messages_with_metadata(&session_file_path, &metadata, &[])
-        {
+        if let Err(e) = crate::session::storage::save_messages_with_metadata(
+            &session_file_path,
+            &metadata,
+            &Conversation::new_unvalidated(vec![]),
+        ) {
             tracing::error!(
                 "[Job {}] Failed to persist metadata for empty job: {}",
                 job.id,
@@ -1281,16 +1352,17 @@ mod tests {
     use super::*;
     use crate::recipe::Recipe;
     use crate::{
-        message::MessageContent,
         model::ModelConfig, // Use the actual ModelConfig for the mock's field
         providers::base::{ProviderMetadata, ProviderUsage, Usage},
         providers::errors::ProviderError,
     };
-    use mcp_core::{content::TextContent, tool::Tool, Role};
+    use rmcp::model::Tool;
+    use rmcp::model::{AnnotateAble, RawTextContent, Role};
     // Removed: use crate::session::storage::{get_most_recent_session, read_metadata};
     // `read_metadata` is still used by the test itself, so keep it or its module.
     use crate::session::storage::read_metadata;
 
+    use crate::conversation::message::{Message, MessageContent};
     use std::env;
     use std::fs::{self, File};
     use std::io::Write;
@@ -1326,14 +1398,16 @@ mod tests {
             _tools: &[Tool],
         ) -> Result<(Message, ProviderUsage), ProviderError> {
             Ok((
-                Message {
-                    role: Role::Assistant,
-                    created: Utc::now().timestamp(),
-                    content: vec![MessageContent::Text(TextContent {
-                        text: "Mocked scheduled response".to_string(),
-                        annotations: None,
-                    })],
-                },
+                Message::new(
+                    Role::Assistant,
+                    Utc::now().timestamp(),
+                    vec![MessageContent::Text(
+                        RawTextContent {
+                            text: "Mocked scheduled response".to_string(),
+                        }
+                        .no_annotation(),
+                    )],
+                ),
                 ProviderUsage::new("mock-scheduler-test".to_string(), Usage::default()),
             ))
         }
@@ -1374,6 +1448,9 @@ mod tests {
             author: None,
             parameters: None,
             settings: None,
+            response: None,
+            sub_recipes: None,
+            retry: None,
         };
         let mut recipe_file = File::create(&recipe_filename)?;
         writeln!(
@@ -1396,8 +1473,7 @@ mod tests {
             execution_mode: Some("background".to_string()), // Default for test
         };
 
-        // Create the mock provider instance for the test
-        let mock_model_config = ModelConfig::new("test_model".to_string());
+        let mock_model_config = ModelConfig::new_or_fail("test_model");
         let mock_provider_instance = create_scheduler_test_mock_provider(mock_model_config);
 
         // Call run_scheduled_job_internal, passing the mock provider

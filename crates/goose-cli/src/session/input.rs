@@ -11,6 +11,7 @@ pub enum InputResult {
     AddExtension(String),
     AddBuiltin(String),
     ToggleTheme,
+    SelectTheme(String),
     Retry,
     ListPrompts(Option<String>),
     PromptCommand(PromptCommandOptions),
@@ -34,6 +35,25 @@ pub struct PlanCommandOptions {
     pub message_text: String,
 }
 
+struct CtrlCHandler;
+
+impl rustyline::ConditionalEventHandler for CtrlCHandler {
+    /// Handle Ctrl+C to clear the line if text is entered, otherwise exit the session.
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: usize,
+        _positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        if !ctx.line().is_empty() {
+            Some(rustyline::Cmd::Kill(rustyline::Movement::WholeBuffer))
+        } else {
+            Some(rustyline::Cmd::Interrupt)
+        }
+    }
+}
+
 pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
 ) -> Result<InputResult> {
@@ -43,7 +63,13 @@ pub fn get_input(
         rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
     );
 
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Char('c'), rustyline::Modifiers::CTRL),
+        rustyline::EventHandler::Conditional(Box::new(CtrlCHandler)),
+    );
+
     let prompt = format!("{} ", console::style("( O)>").cyan().bold());
+
     let input = match editor.readline(&prompt) {
         Ok(text) => text,
         Err(e) => match e {
@@ -103,6 +129,22 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
             Some(InputResult::Retry)
         }
         "/t" => Some(InputResult::ToggleTheme),
+        s if s.starts_with("/t ") => {
+            let t = s
+                .strip_prefix("/t ")
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            if ["light", "dark", "ansi"].contains(&t.as_str()) {
+                Some(InputResult::SelectTheme(t))
+            } else {
+                println!(
+                    "Theme Unavailable: {} Available themes are: light, dark, ansi",
+                    t
+                );
+                Some(InputResult::Retry)
+            }
+        }
         "/prompts" => Some(InputResult::ListPrompts(None)),
         s if s.starts_with(CMD_PROMPTS) => {
             // Parse arguments for /prompts command
@@ -234,6 +276,7 @@ fn print_help() {
         "Available commands:
 /exit or /quit - Exit the session
 /t - Toggle Light/Dark/Ansi theme
+/t <name> - Set theme directly (light, dark, ansi)
 /extension <command> - Add a stdio extension (format: ENV1=val1 command args...)
 /builtin <names> - Add builtin extensions by name (comma-separated)
 /prompts [--extension <name>] - List all available prompts, optionally filtered by extension
@@ -252,7 +295,7 @@ fn print_help() {
 /clear - Clears the current chat history
 
 Navigation:
-Ctrl+C - Interrupt goose (resets the interaction to before the interrupted user request)
+Ctrl+C - Clear current line if text is entered, otherwise exit the session
 Ctrl+J - Add a newline
 Up/Down arrows - Navigate through command history"
     );

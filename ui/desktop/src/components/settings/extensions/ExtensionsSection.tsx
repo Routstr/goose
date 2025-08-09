@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { Button } from '../../ui/button';
 import { Plus } from 'lucide-react';
 import { GPSIcon } from '../../ui/icons';
@@ -33,8 +33,7 @@ export default function ExtensionsSection({
   customToggle,
   selectedExtensions = [],
 }: ExtensionSectionProps) {
-  const { getExtensions, addExtension, removeExtension } = useConfig();
-  const [extensions, setExtensions] = useState<FixedExtensionEntry[]>([]);
+  const { getExtensions, addExtension, removeExtension, extensionsList } = useConfig();
   const [selectedExtension, setSelectedExtension] = useState<FixedExtensionEntry | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -45,18 +44,25 @@ export default function ExtensionsSection({
     showEnvVars
   );
 
-  const fetchExtensions = useCallback(async () => {
-    const extensionsList = await getExtensions(true); // Force refresh
-    // Sort extensions by name to maintain consistent order
-    const sortedExtensions = [...extensionsList]
+  // Update deep link state when props change
+  useEffect(() => {
+    setDeepLinkConfigStateVar(deepLinkConfig);
+    setShowEnvVarsStateVar(showEnvVars);
+  }, [deepLinkConfig, showEnvVars]);
+
+  // Process extensions from context - this automatically updates when extensionsList changes
+  const extensions = useMemo(() => {
+    if (extensionsList.length === 0) return [];
+
+    return [...extensionsList]
       .sort((a, b) => {
         // First sort by builtin
         if (a.type === 'builtin' && b.type !== 'builtin') return -1;
         if (a.type !== 'builtin' && b.type === 'builtin') return 1;
 
         // Then sort by bundled (handle null/undefined cases)
-        const aBundled = a.bundled === true;
-        const bBundled = b.bundled === true;
+        const aBundled = 'bundled' in a && a.bundled === true;
+        const bBundled = 'bundled' in b && b.bundled === true;
         if (aBundled && !bBundled) return -1;
         if (!aBundled && bBundled) return 1;
 
@@ -68,30 +74,15 @@ export default function ExtensionsSection({
         // Use selectedExtensions to determine enabled state in recipe editor
         enabled: disableConfiguration ? selectedExtensions.includes(ext.name) : ext.enabled,
       }));
+  }, [extensionsList, disableConfiguration, selectedExtensions]);
 
-    console.log(
-      'Setting extensions with selectedExtensions:',
-      selectedExtensions,
-      'Extensions:',
-      sortedExtensions
-    );
-    setExtensions(sortedExtensions);
-  }, [getExtensions, disableConfiguration, selectedExtensions]);
-
-  useEffect(() => {
-    fetchExtensions();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const fetchExtensions = useCallback(async () => {
+    await getExtensions(true); // Force refresh - this will update the context
+  }, [getExtensions]);
 
   const handleExtensionToggle = async (extension: FixedExtensionEntry) => {
     if (customToggle) {
       await customToggle(extension);
-      // After custom toggle, update the local state to reflect the change
-      setExtensions((prevExtensions) =>
-        prevExtensions.map((ext) =>
-          ext.name === extension.name ? { ...ext, enabled: !ext.enabled } : ext
-        )
-      );
       return true;
     }
 
@@ -129,25 +120,33 @@ export default function ExtensionsSection({
     const extensionConfig = createExtensionConfig(formData);
     try {
       await activateExtension({ addToConfig: addExtension, extensionConfig: extensionConfig });
+      // Immediately refresh the extensions list after successful activation
+      await fetchExtensions();
     } catch (error) {
       console.error('Failed to activate extension:', error);
-      // Even if activation fails, we don't reopen the modal
-    } finally {
-      // Refresh the extensions list regardless of success or failure
       await fetchExtensions();
     }
   };
 
   const handleUpdateExtension = async (formData: ExtensionFormData) => {
+    if (!selectedExtension) {
+      console.error('No selected extension for update');
+      return;
+    }
+
     // Close the modal immediately
     handleModalClose();
 
     const extensionConfig = createExtensionConfig(formData);
+    const originalName = selectedExtension.name;
+
     try {
       await updateExtension({
         enabled: formData.enabled,
         extensionConfig: extensionConfig,
         addToConfig: addExtension,
+        removeFromConfig: removeExtension,
+        originalName: originalName,
       });
     } catch (error) {
       console.error('Failed to update extension:', error);
@@ -180,21 +179,16 @@ export default function ExtensionsSection({
     setIsModalOpen(false);
     setIsAddModalOpen(false);
     setSelectedExtension(null);
+
+    // Clear any navigation state that might be cached
+    if (window.history.state?.deepLinkConfig) {
+      window.history.replaceState({}, '', window.location.hash);
+    }
   };
 
   return (
-    <section id="extensions" className="px-8">
-      <div className="flex justify-between items-center mb-2">
-        <h2 className="text-xl font-medium text-textStandard">Extensions</h2>
-      </div>
-      <div>
-        <p className="text-sm text-textStandard mb-6">
-          These extensions use the Model Context Protocol (MCP). They can expand Goose's
-          capabilities using three main components: Prompts, Resources, and Tools.
-        </p>
-      </div>
-
-      <div className="border-b border-borderSubtle pb-8">
+    <section id="extensions">
+      <div className="">
         <ExtensionList
           extensions={extensions}
           onToggle={handleExtensionToggle}
@@ -205,14 +199,16 @@ export default function ExtensionsSection({
         {!hideButtons && (
           <div className="flex gap-4 pt-4 w-full">
             <Button
-              className="flex items-center gap-2 justify-center text-white dark:text-black bg-bgAppInverse hover:bg-bgStandardInverse [&>svg]:!size-4"
+              className="flex items-center gap-2 justify-center"
+              variant="default"
               onClick={() => setIsAddModalOpen(true)}
             >
               <Plus className="h-4 w-4" />
               Add custom extension
             </Button>
             <Button
-              className="flex items-center gap-2 justify-center text-textStandard bg-bgApp border border-borderSubtle hover:border-borderProminent hover:bg-bgApp [&>svg]:!size-4"
+              className="flex items-center gap-2 justify-center"
+              variant="secondary"
               onClick={() => window.open('https://block.github.io/goose/v1/extensions/', '_blank')}
             >
               <GPSIcon size={12} />

@@ -1,26 +1,41 @@
-use crate::message::{Message, MessageContent};
+use crate::conversation::message::{Message, MessageContent};
 use crate::model::ModelConfig;
-use crate::providers::base::Usage;
-use crate::providers::errors::ProviderError;
 use crate::providers::utils::{
-    convert_image, detect_image_path, is_valid_function_name, load_image_file,
+    convert_image, detect_image_path, is_valid_function_name, load_image_file, safely_parse_json,
     sanitize_function_name, ImageFormat,
 };
 use anyhow::{anyhow, Error};
-use mcp_core::ToolError;
-use mcp_core::{Content, Role, Tool, ToolCall};
+use mcp_core::{ToolCall, ToolError};
+use rmcp::model::{AnnotateAble, Content, RawContent, ResourceContents, Role, Tool};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+#[derive(Serialize)]
+struct DatabricksMessage {
+    content: Value,
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
 
 /// Convert internal Message format to Databricks' API message specification
 ///   Databricks is mostly OpenAI compatible, but has some differences (reasoning type, etc)
 ///   some openai compatible endpoints use the anthropic image spec at the content level
 ///   even though the message structure is otherwise following openai, the enum switches this
-pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<Value> {
+fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<DatabricksMessage> {
     let mut result = Vec::new();
     for message in messages {
-        let mut converted = json!({
-            "role": message.role
-        });
+        let mut converted = DatabricksMessage {
+            content: Value::Null,
+            role: match message.role {
+                Role::User => "user".to_string(),
+                Role::Assistant => "assistant".to_string(),
+            },
+            tool_calls: None,
+            tool_call_id: None,
+        };
 
         let mut content_array = Vec::new();
         let mut has_tool_calls = false;
@@ -85,15 +100,8 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
                         Ok(tool_call) => {
                             let sanitized_name = sanitize_function_name(&tool_call.name);
 
-                            // Get mutable access to the "tool_calls" field in the converted object
-                            // If "tool_calls" doesn't exist, insert an empty JSON array
-                            let tool_calls = converted
-                                .as_object_mut()
-                                .unwrap()
-                                .entry("tool_calls")
-                                .or_insert(json!([]));
-
-                            tool_calls.as_array_mut().unwrap().push(json!({
+                            let tool_calls = converted.tool_calls.get_or_insert_default();
+                            tool_calls.push(json!({
                                 "id": request.id,
                                 "type": "function",
                                 "function": {
@@ -127,7 +135,7 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
                                         .audience()
                                         .is_none_or(|audience| audience.contains(&Role::Assistant))
                                 })
-                                .map(|content| content.unannotated())
+                                .map(|content| content.raw.clone())
                                 .collect();
 
                             // Process all content, replacing images with placeholder text
@@ -136,49 +144,60 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
 
                             for content in abridged {
                                 match content {
-                                    Content::Image(image) => {
-                                        // Add placeholder text in the tool response
+                                    RawContent::Image(image) => {
                                         tool_content.push(Content::text("This tool result included an image that is uploaded in the next message."));
-
-                                        // Create a separate image message
-                                        image_messages.push(json!({
-                                            "role": "user",
-                                            "content": [convert_image(&image, image_format)]
-                                        }));
+                                        image_messages.push(DatabricksMessage {
+                                            role: "user".to_string(),
+                                            content: [convert_image(
+                                                &image.no_annotation(),
+                                                image_format,
+                                            )]
+                                            .into(),
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                        });
                                     }
-                                    Content::Resource(resource) => {
-                                        tool_content.push(Content::text(resource.get_text()));
+                                    RawContent::Resource(resource) => {
+                                        let text = match &resource.resource {
+                                            ResourceContents::TextResourceContents {
+                                                text, ..
+                                            } => text.clone(),
+                                            _ => String::new(),
+                                        };
+                                        tool_content.push(Content::text(text));
                                     }
                                     _ => {
-                                        tool_content.push(content);
+                                        tool_content.push(content.no_annotation());
                                     }
                                 }
                             }
                             let tool_response_content: Value = json!(tool_content
                                 .iter()
-                                .map(|content| match content {
-                                    Content::Text(text) => text.text.clone(),
-                                    _ => String::new(),
-                                })
+                                .filter_map(|content| content.as_text().map(|t| t.text.clone()))
                                 .collect::<Vec<String>>()
                                 .join(" "));
 
-                            // Add tool response as a separate message
-                            result.push(json!({
-                                "role": "tool",
-                                "content": tool_response_content,
-                                "tool_call_id": response.id
-                            }));
+                            result.push(DatabricksMessage {
+                                content: tool_response_content,
+                                role: "tool".to_string(),
+                                tool_call_id: Some(response.id.clone()),
+                                tool_calls: None,
+                            });
                             // Then add any image messages that need to follow
                             result.extend(image_messages);
                         }
                         Err(e) => {
                             // A tool result error is shown as output so the model can interpret the error message
-                            result.push(json!({
-                                "role": "tool",
-                                "content": format!("The tool call returned the following error:\n{}", e),
-                                "tool_call_id": response.id
-                            }));
+                            result.push(DatabricksMessage {
+                                role: "tool".to_string(),
+                                content: format!(
+                                    "The tool call returned the following error:\n{}",
+                                    e
+                                )
+                                .into(),
+                                tool_call_id: Some(response.id.clone()),
+                                tool_calls: None,
+                            });
                         }
                     }
                 }
@@ -225,9 +244,9 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
                 && !has_multiple_content
                 && content_array[0]["type"] == "text"
             {
-                converted["content"] = json!(content_array[0]["text"]);
+                converted.content = json!(content_array[0]["text"]);
             } else {
-                converted["content"] = json!(content_array);
+                converted.content = json!(content_array);
             }
         }
 
@@ -264,8 +283,8 @@ pub fn format_tools(tools: &[Tool]) -> anyhow::Result<Vec<Value>> {
 }
 
 /// Convert Databricks' API response to internal Message format
-pub fn response_to_message(response: Value) -> anyhow::Result<Message> {
-    let original = response["choices"][0]["message"].clone();
+pub fn response_to_message(response: &Value) -> anyhow::Result<Message> {
+    let original = &response["choices"][0]["message"];
     let mut content = Vec::new();
 
     // Handle array-based content
@@ -322,14 +341,19 @@ pub fn response_to_message(response: Value) -> anyhow::Result<Message> {
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
-                let mut arguments = tool_call["function"]["arguments"]
+
+                // Get the raw arguments string from the LLM.
+                let arguments_str = tool_call["function"]["arguments"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
-                // If arguments is empty, we will have invalid json parsing error later.
-                if arguments.is_empty() {
-                    arguments = "{}".to_string();
-                }
+
+                // If arguments_str is empty, default to an empty JSON object string.
+                let arguments_str = if arguments_str.is_empty() {
+                    "{}".to_string()
+                } else {
+                    arguments_str
+                };
 
                 if !is_valid_function_name(&function_name) {
                     let error = ToolError::NotFound(format!(
@@ -338,7 +362,7 @@ pub fn response_to_message(response: Value) -> anyhow::Result<Message> {
                     ));
                     content.push(MessageContent::tool_request(id, Err(error)));
                 } else {
-                    match serde_json::from_str::<Value>(&arguments) {
+                    match safely_parse_json(&arguments_str) {
                         Ok(params) => {
                             content.push(MessageContent::tool_request(
                                 id,
@@ -347,8 +371,8 @@ pub fn response_to_message(response: Value) -> anyhow::Result<Message> {
                         }
                         Err(e) => {
                             let error = ToolError::InvalidParameters(format!(
-                                "Could not interpret tool use parameters for id {}: {}",
-                                id, e
+                                "Could not interpret tool use parameters for id {}: {}. Raw arguments: '{}'",
+                                id, e, arguments_str
                             ));
                             content.push(MessageContent::tool_request(id, Err(error)));
                         }
@@ -358,38 +382,48 @@ pub fn response_to_message(response: Value) -> anyhow::Result<Message> {
         }
     }
 
-    Ok(Message {
-        role: Role::Assistant,
-        created: chrono::Utc::now().timestamp(),
+    Ok(Message::new(
+        Role::Assistant,
+        chrono::Utc::now().timestamp(),
         content,
-    })
+    ))
 }
 
-pub fn get_usage(data: &Value) -> Result<Usage, ProviderError> {
-    let usage = data
-        .get("usage")
-        .ok_or_else(|| ProviderError::UsageError("No usage data in response".to_string()))?;
+#[derive(Serialize, Deserialize, Debug)]
+struct DeltaToolCallFunction {
+    name: Option<String>,
+    arguments: String, // chunk of encoded JSON,
+}
 
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
+#[derive(Serialize, Deserialize, Debug)]
+struct DeltaToolCall {
+    id: Option<String>,
+    function: DeltaToolCallFunction,
+    index: Option<i32>,
+    r#type: Option<String>,
+}
 
-    let output_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
+#[derive(Serialize, Deserialize, Debug)]
+struct Delta {
+    content: Option<String>,
+    role: Option<String>,
+    tool_calls: Option<Vec<DeltaToolCall>>,
+}
 
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
-        .or_else(|| match (input_tokens, output_tokens) {
-            (Some(input), Some(output)) => Some(input + output),
-            _ => None,
-        });
+#[derive(Serialize, Deserialize, Debug)]
+struct StreamingChoice {
+    delta: Delta,
+    index: Option<i32>,
+    finish_reason: Option<String>,
+}
 
-    Ok(Usage::new(input_tokens, output_tokens, total_tokens))
+#[derive(Serialize, Deserialize, Debug)]
+struct StreamingChunk {
+    choices: Vec<StreamingChoice>,
+    created: Option<i64>,
+    id: Option<String>,
+    usage: Option<Value>,
+    model: String,
 }
 
 /// Validates and fixes tool schemas to ensure they have proper parameter structure.
@@ -438,6 +472,7 @@ fn ensure_valid_json_schema(schema: &mut Value) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn create_request(
     model_config: &ModelConfig,
     system: &str,
@@ -477,10 +512,17 @@ pub fn create_request(
         (model_config.model_name.to_string(), None)
     };
 
-    let system_message = json!({
-        "role": if is_o1 || is_o3 { "developer" } else { "system" },
-        "content": system
-    });
+    let system_message = DatabricksMessage {
+        role: if is_o1 || is_o3 {
+            "developer"
+        } else {
+            "system"
+        }
+        .to_string(),
+        content: system.into(),
+        tool_calls: None,
+        tool_call_id: None,
+    };
 
     let messages_spec = format_messages(messages, image_format);
     let mut tools_spec = if !tools.is_empty() {
@@ -575,7 +617,8 @@ pub fn create_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_core::content::Content;
+    use crate::conversation::message::Message;
+    use rmcp::object;
     use serde_json::json;
 
     #[test]
@@ -680,8 +723,8 @@ mod tests {
         let spec = format_messages(&[message], &ImageFormat::OpenAi);
 
         assert_eq!(spec.len(), 1);
-        assert_eq!(spec[0]["role"], "user");
-        assert_eq!(spec[0]["content"], "Hello");
+        assert_eq!(spec[0].role, "user");
+        assert_eq!(spec[0].content, "Hello");
         Ok(())
     }
 
@@ -690,7 +733,7 @@ mod tests {
         let tool = Tool::new(
             "test_tool",
             "A test tool",
-            json!({
+            object!({
                 "type": "object",
                 "properties": {
                     "input": {
@@ -700,7 +743,6 @@ mod tests {
                 },
                 "required": ["input"]
             }),
-            None,
         );
 
         let spec = format_tools(&[tool])?;
@@ -724,7 +766,7 @@ mod tests {
 
         // Get the ID from the tool request to use in the response
         let tool_id = if let MessageContent::ToolRequest(request) = &messages[2].content[0] {
-            request.id.clone()
+            &request.id
         } else {
             panic!("should be tool request");
         };
@@ -732,7 +774,9 @@ mod tests {
         messages
             .push(Message::user().with_tool_response(tool_id, Ok(vec![Content::text("Result")])));
 
-        let spec = format_messages(&messages, &ImageFormat::OpenAi);
+        let as_value =
+            serde_json::to_value(format_messages(&messages, &ImageFormat::OpenAi)).unwrap();
+        let spec = as_value.as_array().unwrap();
 
         assert_eq!(spec.len(), 4);
         assert_eq!(spec[0]["role"], "assistant");
@@ -757,7 +801,7 @@ mod tests {
 
         // Get the ID from the tool request to use in the response
         let tool_id = if let MessageContent::ToolRequest(request) = &messages[0].content[0] {
-            request.id.clone()
+            &request.id
         } else {
             panic!("should be tool request");
         };
@@ -765,7 +809,9 @@ mod tests {
         messages
             .push(Message::user().with_tool_response(tool_id, Ok(vec![Content::text("Result")])));
 
-        let spec = format_messages(&messages, &ImageFormat::OpenAi);
+        let as_value =
+            serde_json::to_value(format_messages(&messages, &ImageFormat::OpenAi)).unwrap();
+        let spec = as_value.as_array().unwrap();
 
         assert_eq!(spec.len(), 2);
         assert_eq!(spec[0]["role"], "assistant");
@@ -782,7 +828,7 @@ mod tests {
         let tool1 = Tool::new(
             "test_tool",
             "Test tool",
-            json!({
+            object!({
                 "type": "object",
                 "properties": {
                     "input": {
@@ -792,13 +838,12 @@ mod tests {
                 },
                 "required": ["input"]
             }),
-            None,
         );
 
         let tool2 = Tool::new(
             "test_tool",
             "Test tool",
-            json!({
+            object!({
                 "type": "object",
                 "properties": {
                     "input": {
@@ -808,7 +853,6 @@ mod tests {
                 },
                 "required": ["input"]
             }),
-            None,
         );
 
         let result = format_tools(&[tool1, tool2]);
@@ -838,12 +882,14 @@ mod tests {
             0x0D, 0x0A, 0x1A, 0x0A, // PNG header
             0x00, 0x00, 0x00, 0x0D, // Rest of fake PNG data
         ];
-        std::fs::write(&png_path, &png_data)?;
+        std::fs::write(&png_path, png_data)?;
         let png_path_str = png_path.to_str().unwrap();
 
         // Create message with image path
         let message = Message::user().with_text(format!("Here is an image: {}", png_path_str));
-        let spec = format_messages(&[message], &ImageFormat::OpenAi);
+        let as_value =
+            serde_json::to_value(format_messages(&[message], &ImageFormat::OpenAi)).unwrap();
+        let spec = as_value.as_array().unwrap();
 
         assert_eq!(spec.len(), 1);
         assert_eq!(spec[0]["role"], "user");
@@ -878,7 +924,7 @@ mod tests {
             }
         });
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
         assert_eq!(message.content.len(), 1);
         if let MessageContent::Text(text) = &message.content[0] {
             assert_eq!(text.text, "Hello from John Cena!");
@@ -893,7 +939,7 @@ mod tests {
     #[test]
     fn test_response_to_message_valid_toolrequest() -> anyhow::Result<()> {
         let response: Value = serde_json::from_str(OPENAI_TOOL_USE_RESPONSE)?;
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
 
         assert_eq!(message.content.len(), 1);
         if let MessageContent::ToolRequest(request) = &message.content[0] {
@@ -913,7 +959,7 @@ mod tests {
         response["choices"][0]["message"]["tool_calls"][0]["function"]["name"] =
             json!("invalid fn");
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
 
         if let MessageContent::ToolRequest(request) = &message.content[0] {
             match &request.tool_call {
@@ -935,7 +981,7 @@ mod tests {
         response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
             json!("invalid json {");
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
 
         if let MessageContent::ToolRequest(request) = &message.content[0] {
             match &request.tool_call {
@@ -957,7 +1003,7 @@ mod tests {
         response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
             serde_json::Value::String("".to_string());
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
 
         if let MessageContent::ToolRequest(request) = &message.content[0] {
             let tool_call = request.tool_call.as_ref().unwrap();
@@ -975,7 +1021,6 @@ mod tests {
         // Test default medium reasoning effort for O3 model
         let model_config = ModelConfig {
             model_name: "gpt-4o".to_string(),
-            tokenizer_name: "gpt-4o".to_string(),
             context_limit: Some(4096),
             temperature: None,
             max_tokens: Some(1024),
@@ -1007,7 +1052,6 @@ mod tests {
         // Test default medium reasoning effort for O1 model
         let model_config = ModelConfig {
             model_name: "o1".to_string(),
-            tokenizer_name: "o1".to_string(),
             context_limit: Some(4096),
             temperature: None,
             max_tokens: Some(1024),
@@ -1040,7 +1084,6 @@ mod tests {
         // Test custom reasoning effort for O3 model
         let model_config = ModelConfig {
             model_name: "o3-mini-high".to_string(),
-            tokenizer_name: "o3-mini".to_string(),
             context_limit: Some(4096),
             temperature: None,
             max_tokens: Some(1024),
@@ -1097,7 +1140,7 @@ mod tests {
             }]
         });
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
         assert_eq!(message.content.len(), 2);
 
         if let MessageContent::Thinking(thinking) = &message.content[0] {
@@ -1144,7 +1187,7 @@ mod tests {
             }]
         });
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
         assert_eq!(message.content.len(), 2);
 
         if let MessageContent::RedactedThinking(redacted) = &message.content[0] {

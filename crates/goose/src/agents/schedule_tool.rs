@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use mcp_core::{Content, ToolError, ToolResult};
+use mcp_core::{ToolError, ToolResult};
+use rmcp::model::Content;
 
 use crate::recipe::Recipe;
 use crate::scheduler_trait::SchedulerTrait;
@@ -372,9 +373,17 @@ impl Agent {
             })?;
 
         // Get the session file path
-        let session_path = crate::session::storage::get_path(
+        let session_path = match crate::session::storage::get_path(
             crate::session::storage::Identifier::Name(session_id.to_string()),
-        );
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                return Err(ToolError::ExecutionError(format!(
+                    "Invalid session ID '{}': {}",
+                    session_id, e
+                )));
+            }
+        };
 
         // Check if session file exists
         if !session_path.exists() {

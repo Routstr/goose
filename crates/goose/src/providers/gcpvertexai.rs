@@ -2,12 +2,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use once_cell::sync::Lazy;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use tokio::time::sleep;
 use url::Url;
 
-use crate::message::Message;
+use crate::conversation::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage};
 
@@ -17,10 +18,12 @@ use crate::providers::formats::gcpvertexai::{
     ModelProvider, RequestContext,
 };
 
+use crate::impl_provider_default;
 use crate::providers::formats::gcpvertexai::GcpLocation::Iowa;
 use crate::providers::gcpauth::GcpAuth;
+use crate::providers::retry::RetryConfig;
 use crate::providers::utils::emit_debug_trace;
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 
 /// Base URL for GCP Vertex AI documentation
 const GCP_VERTEX_AI_DOC_URL: &str = "https://cloud.google.com/vertex-ai";
@@ -34,6 +37,9 @@ const DEFAULT_MAX_RETRIES: usize = 6;
 const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 /// Default maximum interval for retry (in milliseconds)
 const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 320_000;
+/// Status code for Anthropic's API overloaded error (529)
+static STATUS_API_OVERLOADED: Lazy<StatusCode> =
+    Lazy::new(|| StatusCode::from_u16(529).expect("Valid status code 529 for API_OVERLOADED"));
 
 /// Represents errors specific to GCP Vertex AI operations.
 #[derive(Debug, thiserror::Error)]
@@ -45,53 +51,6 @@ enum GcpVertexAIError {
     /// Error during GCP authentication
     #[error("Authentication error: {0}")]
     AuthError(String),
-}
-
-/// Retry configuration for handling rate limit errors
-#[derive(Debug, Clone)]
-struct RetryConfig {
-    /// Maximum number of retry attempts
-    max_retries: usize,
-    /// Initial interval between retries in milliseconds
-    initial_interval_ms: u64,
-    /// Multiplier for backoff (exponential)
-    backoff_multiplier: f64,
-    /// Maximum interval between retries in milliseconds
-    max_interval_ms: u64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: DEFAULT_MAX_RETRIES,
-            initial_interval_ms: DEFAULT_INITIAL_RETRY_INTERVAL_MS,
-            backoff_multiplier: DEFAULT_BACKOFF_MULTIPLIER,
-            max_interval_ms: DEFAULT_MAX_RETRY_INTERVAL_MS,
-        }
-    }
-}
-
-impl RetryConfig {
-    /// Calculate the delay for a specific retry attempt (with jitter)
-    fn delay_for_attempt(&self, attempt: usize) -> Duration {
-        if attempt == 0 {
-            return Duration::from_millis(0);
-        }
-
-        // Calculate exponential backoff
-        let exponent = (attempt - 1) as u32;
-        let base_delay_ms = (self.initial_interval_ms as f64
-            * self.backoff_multiplier.powi(exponent as i32)) as u64;
-
-        // Apply max limit
-        let capped_delay_ms = std::cmp::min(base_delay_ms, self.max_interval_ms);
-
-        // Add jitter (+/-20% randomness) to avoid thundering herd problem
-        let jitter_factor = 0.8 + (rand::random::<f64>() * 0.4); // Between 0.8 and 1.2
-        let jittered_delay_ms = (capped_delay_ms as f64 * jitter_factor) as u64;
-
-        Duration::from_millis(jittered_delay_ms)
-    }
 }
 
 /// Provider implementation for Google Cloud Platform's Vertex AI service.
@@ -172,6 +131,7 @@ impl GcpVertexAIProvider {
 
     /// Loads retry configuration from environment variables or uses defaults.
     fn load_retry_config(config: &crate::config::Config) -> RetryConfig {
+        // Load max retries for 429 rate limit errors
         let max_retries = config
             .get_param("GCP_MAX_RETRIES")
             .ok()
@@ -196,12 +156,12 @@ impl GcpVertexAIProvider {
             .and_then(|v: String| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_MAX_RETRY_INTERVAL_MS);
 
-        RetryConfig {
+        RetryConfig::new(
             max_retries,
             initial_interval_ms,
             backoff_multiplier,
             max_interval_ms,
-        }
+        )
     }
 
     /// Determines the appropriate GCP location for model deployment.
@@ -238,14 +198,14 @@ impl GcpVertexAIProvider {
     ) -> Result<Url, GcpVertexAIError> {
         // Create host URL for the specified location
         let host_url = if self.location == location {
-            self.host.clone()
+            &self.host
         } else {
             // Only allocate a new string if location differs
-            self.host.replace(&self.location, location)
+            &self.host.replace(&self.location, location)
         };
 
         let base_url =
-            Url::parse(&host_url).map_err(|e| GcpVertexAIError::InvalidUrl(e.to_string()))?;
+            Url::parse(host_url).map_err(|e| GcpVertexAIError::InvalidUrl(e.to_string()))?;
 
         // Determine endpoint based on provider type
         let endpoint = match provider {
@@ -269,7 +229,7 @@ impl GcpVertexAIProvider {
     }
 
     /// Makes an authenticated POST request to the Vertex AI API at a specific location.
-    /// Includes retry logic for 429 Too Many Requests errors.
+    /// Includes retry logic for 429 (Too Many Requests) and 529 (API Overloaded) errors.
     ///
     /// # Arguments
     /// * `payload` - The request payload to send
@@ -285,15 +245,18 @@ impl GcpVertexAIProvider {
             .build_request_url(context.provider(), location)
             .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
 
-        // Initialize retry counter
-        let mut attempts = 0;
+        // Initialize separate counters for different error types
+        let mut rate_limit_attempts = 0;
+        let mut overloaded_attempts = 0;
         let mut last_error = None;
 
         loop {
             // Check if we've exceeded max retries
-            if attempts > 0 && attempts > self.retry_config.max_retries {
+            if rate_limit_attempts > self.retry_config.max_retries
+                && overloaded_attempts > self.retry_config.max_retries
+            {
                 let error_msg = format!(
-                    "Exceeded maximum retry attempts ({}) for rate limiting (429)",
+                    "Exceeded maximum retry attempts ({}) for rate limiting errors",
                     self.retry_config.max_retries
                 );
                 tracing::error!("{}", error_msg);
@@ -318,60 +281,116 @@ impl GcpVertexAIProvider {
 
             let status = response.status();
 
-            // If not a 429, process normally
-            if status != StatusCode::TOO_MANY_REQUESTS {
-                let response_json = response.json::<Value>().await.map_err(|e| {
-                    ProviderError::RequestFailed(format!("Failed to parse response: {e}"))
-                })?;
+            // Handle 429 Too Many Requests and 529 API Overloaded errors
+            match status {
+                status if status == StatusCode::TOO_MANY_REQUESTS => {
+                    rate_limit_attempts += 1;
 
-                return match status {
-                    StatusCode::OK => Ok(response_json),
-                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                        tracing::debug!(
-                            "Authentication failed. Status: {status}, Payload: {payload:?}"
+                    if rate_limit_attempts > self.retry_config.max_retries {
+                        let error_msg = format!(
+                            "Exceeded maximum retry attempts ({}) for rate limiting (429) errors",
+                            self.retry_config.max_retries
                         );
-                        Err(ProviderError::Authentication(format!(
-                            "Authentication failed: {response_json:?}"
-                        )))
-                    }
-                    _ => {
-                        tracing::debug!(
-                            "Request failed. Status: {status}, Response: {response_json:?}"
+                        tracing::error!("{}", error_msg);
+                        return Err(
+                            last_error.unwrap_or(ProviderError::RateLimitExceeded(error_msg))
                         );
-                        Err(ProviderError::RequestFailed(format!(
-                            "Request failed with status {status}: {response_json:?}"
-                        )))
                     }
-                };
+
+                    // Try to parse response for more detailed error info
+                    let cite_gcp_vertex_429 =
+                        "See https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429";
+                    let response_text = response.text().await.unwrap_or_default();
+
+                    let error_message =
+                        if response_text.contains("Exceeded the Provisioned Throughput") {
+                            // Handle 429 rate limit due to throughput limits
+                            format!("Exceeded the Provisioned Throughput: {cite_gcp_vertex_429}")
+                        } else {
+                            // Handle generic 429 rate limit
+                            format!("Pay-as-you-go resource exhausted: {cite_gcp_vertex_429}")
+                        };
+
+                    tracing::warn!(
+                        "Rate limit exceeded error (429) (attempt {}/{}): {}. Retrying after backoff...",
+                        rate_limit_attempts,
+                        self.retry_config.max_retries,
+                        error_message
+                    );
+
+                    // Store the error in case we need to return it after max retries
+                    last_error = Some(ProviderError::RateLimitExceeded(error_message));
+
+                    // Calculate and apply the backoff delay
+                    let delay = self.retry_config.delay_for_attempt(rate_limit_attempts);
+                    tracing::info!("Backing off for {:?} before retry (rate limit 429)", delay);
+                    sleep(delay).await;
+                }
+                status if status == *STATUS_API_OVERLOADED => {
+                    overloaded_attempts += 1;
+
+                    if overloaded_attempts > self.retry_config.max_retries {
+                        let error_msg = format!(
+                            "Exceeded maximum retry attempts ({}) for API overloaded (529) errors",
+                            self.retry_config.max_retries
+                        );
+                        tracing::error!("{}", error_msg);
+                        return Err(
+                            last_error.unwrap_or(ProviderError::RateLimitExceeded(error_msg))
+                        );
+                    }
+
+                    // Handle 529 Overloaded error (https://docs.anthropic.com/en/api/errors)
+                    let error_message =
+                        "Vertex AI Provider API is temporarily overloaded. This is similar to a rate limit \
+                        error but indicates backend processing capacity issues."
+                            .to_string();
+
+                    tracing::warn!(
+                        "API overloaded error (529) (attempt {}/{}): {}. Retrying after backoff...",
+                        overloaded_attempts,
+                        self.retry_config.max_retries,
+                        error_message
+                    );
+
+                    // Store the error in case we need to return it after max retries
+                    last_error = Some(ProviderError::RateLimitExceeded(error_message));
+
+                    // Calculate and apply the backoff delay
+                    let delay = self.retry_config.delay_for_attempt(overloaded_attempts);
+                    tracing::info!(
+                        "Backing off for {:?} before retry (API overloaded 529)",
+                        delay
+                    );
+                    sleep(delay).await;
+                }
+                // For any other status codes, process normally
+                _ => {
+                    let response_json = response.json::<Value>().await.map_err(|e| {
+                        ProviderError::RequestFailed(format!("Failed to parse response: {e}"))
+                    })?;
+
+                    return match status {
+                        StatusCode::OK => Ok(response_json),
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                            tracing::debug!(
+                                "Authentication failed. Status: {status}, Payload: {payload:?}"
+                            );
+                            Err(ProviderError::Authentication(format!(
+                                "Authentication failed: {response_json:?}"
+                            )))
+                        }
+                        _ => {
+                            tracing::debug!(
+                                "Request failed. Status: {status}, Response: {response_json:?}"
+                            );
+                            Err(ProviderError::RequestFailed(format!(
+                                "Request failed with status {status}: {response_json:?}"
+                            )))
+                        }
+                    };
+                }
             }
-
-            // Handle 429 Too Many Requests
-            attempts += 1;
-
-            // Try to parse response for more detailed error info
-            let cite_gcp_vertex_429 =
-                "See https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429";
-            let response_text = response.text().await.unwrap_or_default();
-            let quota_error = if response_text.contains("Exceeded the Provisioned Throughput") {
-                format!("Exceeded the Provisioned Throughput: {cite_gcp_vertex_429}.")
-            } else {
-                format!("Pay-as-you-go resource exhausted: {cite_gcp_vertex_429}.")
-            };
-
-            tracing::warn!(
-                "Rate limit exceeded (attempt {}/{}): {}. Retrying after backoff...",
-                attempts,
-                self.retry_config.max_retries,
-                quota_error
-            );
-
-            // Store the error in case we need to return it after max retries
-            last_error = Some(ProviderError::RateLimitExceeded(quota_error));
-
-            // Calculate and apply the backoff delay
-            let delay = self.retry_config.delay_for_attempt(attempts);
-            tracing::info!("Backing off for {:?} before retry", delay);
-            sleep(delay).await;
         }
     }
 
@@ -380,10 +399,14 @@ impl GcpVertexAIProvider {
     /// # Arguments
     /// * `payload` - The request payload to send
     /// * `context` - Request context containing model information
-    async fn post(&self, payload: Value, context: &RequestContext) -> Result<Value, ProviderError> {
+    async fn post(
+        &self,
+        payload: &Value,
+        context: &RequestContext,
+    ) -> Result<Value, ProviderError> {
         // Try with user-specified location first
         let result = self
-            .post_with_location(&payload, context, &self.location)
+            .post_with_location(payload, context, &self.location)
             .await;
 
         // If location is already the known location for the model or request succeeded, return result
@@ -402,7 +425,7 @@ impl GcpVertexAIProvider {
                     "Trying known location {known_location} for {model_name} instead of {configured_location}: {msg}"
                 );
 
-                self.post_with_location(&payload, context, &known_location)
+                self.post_with_location(payload, context, &known_location)
                     .await
             }
             // For any other error, return the original result
@@ -411,12 +434,7 @@ impl GcpVertexAIProvider {
     }
 }
 
-impl Default for GcpVertexAIProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(Self::metadata().default_model);
-        Self::new(model).expect("Failed to initialize VertexAI provider")
-    }
-}
+impl_provider_default!(GcpVertexAIProvider);
 
 #[async_trait]
 impl Provider for GcpVertexAIProvider {
@@ -431,12 +449,15 @@ impl Provider for GcpVertexAIProvider {
             GcpVertexAIModel::Claude(ClaudeVersion::Sonnet37),
             GcpVertexAIModel::Claude(ClaudeVersion::Haiku35),
             GcpVertexAIModel::Claude(ClaudeVersion::Sonnet4),
+            GcpVertexAIModel::Claude(ClaudeVersion::Opus4),
             GcpVertexAIModel::Gemini(GeminiVersion::Pro15),
             GcpVertexAIModel::Gemini(GeminiVersion::Flash20),
             GcpVertexAIModel::Gemini(GeminiVersion::Pro20Exp),
             GcpVertexAIModel::Gemini(GeminiVersion::Pro25Exp),
             GcpVertexAIModel::Gemini(GeminiVersion::Flash25Preview),
             GcpVertexAIModel::Gemini(GeminiVersion::Pro25Preview),
+            GcpVertexAIModel::Gemini(GeminiVersion::Flash25),
+            GcpVertexAIModel::Gemini(GeminiVersion::Pro25),
         ]
         .iter()
         .map(|model| model.to_string())
@@ -448,7 +469,7 @@ impl Provider for GcpVertexAIProvider {
             "gcp_vertex_ai",
             "GCP Vertex AI",
             "Access variety of AI models such as Claude, Gemini through Vertex AI",
-            GcpVertexAIModel::Gemini(GeminiVersion::Flash20)
+            GcpVertexAIModel::Gemini(GeminiVersion::Flash25)
                 .to_string()
                 .as_str(),
             known_models,
@@ -504,7 +525,7 @@ impl Provider for GcpVertexAIProvider {
         let (request, context) = create_request(&self.model, system, messages, tools)?;
 
         // Send request and process response
-        let response = self.post(request.clone(), &context).await?;
+        let response = self.post(&request, &context).await?;
         let usage = get_usage(&response, &context)?;
 
         emit_debug_trace(&self.model, &request, &response, &usage);
@@ -525,15 +546,11 @@ impl Provider for GcpVertexAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
 
     #[test]
     fn test_retry_config_delay_calculation() {
-        let config = RetryConfig {
-            max_retries: 5,
-            initial_interval_ms: 1000,
-            backoff_multiplier: 2.0,
-            max_interval_ms: 32000,
-        };
+        let config = RetryConfig::new(5, 1000, 2.0, 32000);
 
         // First attempt has no delay
         let delay0 = config.delay_for_attempt(0);
@@ -553,6 +570,23 @@ mod tests {
     }
 
     #[test]
+    fn test_status_overloaded_code() {
+        // Test that we correctly handle the 529 status code
+
+        // Verify the custom status code is created correctly
+        assert_eq!(STATUS_API_OVERLOADED.as_u16(), 529);
+
+        // This is not a standard HTTP status code, so it's classified as server error
+        assert!(STATUS_API_OVERLOADED.is_server_error());
+
+        // Should be different from TOO_MANY_REQUESTS (429)
+        assert_ne!(*STATUS_API_OVERLOADED, StatusCode::TOO_MANY_REQUESTS);
+
+        // Should be different from SERVICE_UNAVAILABLE (503)
+        assert_ne!(*STATUS_API_OVERLOADED, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
     fn test_model_provider_conversion() {
         assert_eq!(ModelProvider::Anthropic.as_str(), "anthropic");
         assert_eq!(ModelProvider::Google.as_str(), "google");
@@ -562,7 +596,7 @@ mod tests {
     fn test_url_construction() {
         use url::Url;
 
-        let model_config = ModelConfig::new("claude-3-5-sonnet-v2@20241022".to_string());
+        let model_config = ModelConfig::new_or_fail("claude-3-5-sonnet-v2@20241022");
         let context = RequestContext::new(&model_config.model_name).unwrap();
         let api_model_id = context.model.to_string();
 
@@ -596,6 +630,7 @@ mod tests {
             .collect();
         assert!(model_names.contains(&"claude-3-5-sonnet-v2@20241022".to_string()));
         assert!(model_names.contains(&"gemini-1.5-pro-002".to_string()));
+        assert!(model_names.contains(&"gemini-2.5-pro".to_string()));
         // Should contain the original 2 config keys plus 4 new retry-related ones
         assert_eq!(metadata.config_keys.len(), 6);
     }

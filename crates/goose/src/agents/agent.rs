@@ -1,57 +1,91 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use futures::stream::BoxStream;
-use futures::{FutureExt, Stream, TryStreamExt};
-use futures_util::stream;
-use futures_util::stream::StreamExt;
-use mcp_core::protocol::JsonRpcMessage;
-
-use crate::config::{Config, ExtensionConfigManager, PermissionManager};
-use crate::message::Message;
-use crate::permission::permission_judge::check_tool_permissions;
-use crate::permission::PermissionConfirmation;
-use crate::providers::base::Provider;
-use crate::providers::errors::ProviderError;
-use crate::recipe::{Author, Recipe, Settings};
-use crate::scheduler_trait::SchedulerTrait;
-use crate::tool_monitor::{ToolCall, ToolMonitor};
-use regex::Regex;
-use serde_json::Value;
-use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, instrument};
+use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
+use uuid::Uuid;
 
 use crate::agents::extension::{ExtensionConfig, ExtensionError, ExtensionResult, ToolInfo};
 use crate::agents::extension_manager::{get_parameter_names, ExtensionManager};
+use crate::agents::final_output_tool::{FINAL_OUTPUT_CONTINUATION_MESSAGE, FINAL_OUTPUT_TOOL_NAME};
 use crate::agents::platform_tools::{
     PLATFORM_LIST_RESOURCES_TOOL_NAME, PLATFORM_MANAGE_EXTENSIONS_TOOL_NAME,
     PLATFORM_MANAGE_SCHEDULE_TOOL_NAME, PLATFORM_READ_RESOURCE_TOOL_NAME,
     PLATFORM_SEARCH_AVAILABLE_EXTENSIONS_TOOL_NAME,
 };
 use crate::agents::prompt_manager::PromptManager;
-use crate::agents::router_tool_selector::{
-    create_tool_selector, RouterToolSelectionStrategy, RouterToolSelector,
+use crate::agents::recipe_tools::dynamic_task_tools::{
+    create_dynamic_task, create_dynamic_task_tool, DYNAMIC_TASK_TOOL_NAME_PREFIX,
 };
+use crate::agents::retry::{RetryManager, RetryResult};
+use crate::agents::router_tool_selector::RouterToolSelectionStrategy;
 use crate::agents::router_tools::{ROUTER_LLM_SEARCH_TOOL_NAME, ROUTER_VECTOR_SEARCH_TOOL_NAME};
+use crate::agents::sub_recipe_manager::SubRecipeManager;
+use crate::agents::subagent_execution_tool::subagent_execute_task_tool::{
+    self, SUBAGENT_EXECUTE_TASK_TOOL_NAME,
+};
+use crate::agents::subagent_execution_tool::tasks_manager::TasksManager;
+use crate::agents::tool_route_manager::ToolRouteManager;
 use crate::agents::tool_router_index_manager::ToolRouterIndexManager;
-use crate::agents::tool_vectordb::generate_table_id;
 use crate::agents::types::SessionConfig;
 use crate::agents::types::{FrontendTool, ToolResultReceiver};
-use mcp_core::{
-    prompt::Prompt, protocol::GetPromptResult, tool::Tool, Content, ToolError, ToolResult,
-};
+use crate::config::{Config, ExtensionConfigManager, PermissionManager};
+use crate::context_mgmt::auto_compact;
+use crate::conversation::{debug_conversation_fix, fix_conversation, Conversation};
+use crate::permission::permission_judge::{check_tool_permissions, PermissionCheckResult};
+use crate::permission::PermissionConfirmation;
+use crate::providers::base::Provider;
+use crate::providers::errors::ProviderError;
+use crate::recipe::{Author, Recipe, Response, Settings, SubRecipe};
+use crate::scheduler_trait::SchedulerTrait;
+use crate::session;
+use crate::tool_monitor::{ToolCall, ToolMonitor};
+use crate::utils::is_token_cancelled;
+use mcp_core::{ToolError, ToolResult};
+use regex::Regex;
+use rmcp::model::{Content, GetPromptResult, Prompt, ServerNotification, Tool};
+use serde_json::Value;
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, instrument};
 
+use super::final_output_tool::FinalOutputTool;
 use super::platform_tools;
-use super::router_tools;
 use super::tool_execution::{ToolCallResult, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
+use crate::agents::subagent_task_config::TaskConfig;
+use crate::conversation::message::{Message, ToolRequest};
+
+const DEFAULT_MAX_TURNS: u32 = 1000;
+
+/// Context needed for the reply function
+pub struct ReplyContext {
+    pub messages: Conversation,
+    pub tools: Vec<Tool>,
+    pub toolshim_tools: Vec<Tool>,
+    pub system_prompt: String,
+    pub goose_mode: String,
+    pub initial_messages: Vec<Message>,
+    pub config: &'static Config,
+}
+
+pub struct ToolCategorizeResult {
+    pub frontend_requests: Vec<ToolRequest>,
+    pub remaining_requests: Vec<ToolRequest>,
+    pub filtered_response: Message,
+    pub readonly_tools: HashSet<String>,
+    pub regular_tools: HashSet<String>,
+}
 
 /// The main goose Agent
 pub struct Agent {
     pub(super) provider: Mutex<Option<Arc<dyn Provider>>>,
-    pub(super) extension_manager: Mutex<ExtensionManager>,
+    pub extension_manager: Arc<RwLock<ExtensionManager>>,
+    pub(super) sub_recipe_manager: Mutex<SubRecipeManager>,
+    pub(super) tasks_manager: TasksManager,
+    pub(super) final_output_tool: Arc<Mutex<Option<FinalOutputTool>>>,
     pub(super) frontend_tools: Mutex<HashMap<String, FrontendTool>>,
     pub(super) frontend_instructions: Mutex<Option<String>>,
     pub(super) prompt_manager: Mutex<PromptManager>,
@@ -59,61 +93,18 @@ pub struct Agent {
     pub(super) confirmation_rx: Mutex<mpsc::Receiver<(String, PermissionConfirmation)>>,
     pub(super) tool_result_tx: mpsc::Sender<(String, ToolResult<Vec<Content>>)>,
     pub(super) tool_result_rx: ToolResultReceiver,
-    pub(super) tool_monitor: Mutex<Option<ToolMonitor>>,
-    pub(super) router_tool_selector: Mutex<Option<Arc<Box<dyn RouterToolSelector>>>>,
+    pub(super) tool_monitor: Arc<Mutex<Option<ToolMonitor>>>,
+    pub(super) tool_route_manager: ToolRouteManager,
     pub(super) scheduler_service: Mutex<Option<Arc<dyn SchedulerTrait>>>,
+    pub(super) retry_manager: RetryManager,
 }
 
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
     Message(Message),
-    McpNotification((String, JsonRpcMessage)),
+    McpNotification((String, ServerNotification)),
     ModelChange { model: String, mode: String },
-}
-
-impl Agent {
-    pub fn new() -> Self {
-        // Create channels with buffer size 32 (adjust if needed)
-        let (confirm_tx, confirm_rx) = mpsc::channel(32);
-        let (tool_tx, tool_rx) = mpsc::channel(32);
-
-        Self {
-            provider: Mutex::new(None),
-            extension_manager: Mutex::new(ExtensionManager::new()),
-            frontend_tools: Mutex::new(HashMap::new()),
-            frontend_instructions: Mutex::new(None),
-            prompt_manager: Mutex::new(PromptManager::new()),
-            confirmation_tx: confirm_tx,
-            confirmation_rx: Mutex::new(confirm_rx),
-            tool_result_tx: tool_tx,
-            tool_result_rx: Arc::new(Mutex::new(tool_rx)),
-            tool_monitor: Mutex::new(None),
-            router_tool_selector: Mutex::new(None),
-            scheduler_service: Mutex::new(None),
-        }
-    }
-
-    pub async fn configure_tool_monitor(&self, max_repetitions: Option<u32>) {
-        let mut tool_monitor = self.tool_monitor.lock().await;
-        *tool_monitor = Some(ToolMonitor::new(max_repetitions));
-    }
-
-    pub async fn get_tool_stats(&self) -> Option<HashMap<String, u32>> {
-        let tool_monitor = self.tool_monitor.lock().await;
-        tool_monitor.as_ref().map(|monitor| monitor.get_stats())
-    }
-
-    pub async fn reset_tool_monitor(&self) {
-        if let Some(monitor) = self.tool_monitor.lock().await.as_mut() {
-            monitor.reset();
-        }
-    }
-
-    /// Set the scheduler service for this agent
-    pub async fn set_scheduler(&self, scheduler: Arc<dyn SchedulerTrait>) {
-        let mut scheduler_service = self.scheduler_service.lock().await;
-        *scheduler_service = Some(scheduler);
-    }
+    HistoryReplaced(Vec<Message>),
 }
 
 impl Default for Agent {
@@ -123,19 +114,19 @@ impl Default for Agent {
 }
 
 pub enum ToolStreamItem<T> {
-    Message(JsonRpcMessage),
+    Message(ServerNotification),
     Result(T),
 }
 
 pub type ToolStream = Pin<Box<dyn Stream<Item = ToolStreamItem<ToolResult<Vec<Content>>>> + Send>>;
 
-// tool_stream combines a stream of JsonRpcMessages with a future representing the
+// tool_stream combines a stream of ServerNotifications with a future representing the
 // final result of the tool call. MCP notifications are not request-scoped, but
 // this lets us capture all notifications emitted during the tool call for
 // simpler consumption
 pub fn tool_stream<S, F>(rx: S, done: F) -> ToolStream
 where
-    S: Stream<Item = JsonRpcMessage> + Send + Unpin + 'static,
+    S: Stream<Item = ServerNotification> + Send + Unpin + 'static,
     F: Future<Output = ToolResult<Vec<Content>>> + Send + 'static,
 {
     Box::pin(async_stream::stream! {
@@ -157,6 +148,182 @@ where
 }
 
 impl Agent {
+    pub fn new() -> Self {
+        // Create channels with buffer size 32 (adjust if needed)
+        let (confirm_tx, confirm_rx) = mpsc::channel(32);
+        let (tool_tx, tool_rx) = mpsc::channel(32);
+
+        let tool_monitor = Arc::new(Mutex::new(None));
+        let retry_manager = RetryManager::with_tool_monitor(tool_monitor.clone());
+
+        Self {
+            provider: Mutex::new(None),
+            extension_manager: Arc::new(RwLock::new(ExtensionManager::new())),
+            sub_recipe_manager: Mutex::new(SubRecipeManager::new()),
+            tasks_manager: TasksManager::new(),
+            final_output_tool: Arc::new(Mutex::new(None)),
+            frontend_tools: Mutex::new(HashMap::new()),
+            frontend_instructions: Mutex::new(None),
+            prompt_manager: Mutex::new(PromptManager::new()),
+            confirmation_tx: confirm_tx,
+            confirmation_rx: Mutex::new(confirm_rx),
+            tool_result_tx: tool_tx,
+            tool_result_rx: Arc::new(Mutex::new(tool_rx)),
+            tool_monitor,
+            tool_route_manager: ToolRouteManager::new(),
+            scheduler_service: Mutex::new(None),
+            retry_manager,
+        }
+    }
+
+    pub async fn configure_tool_monitor(&self, max_repetitions: Option<u32>) {
+        let mut tool_monitor = self.tool_monitor.lock().await;
+        *tool_monitor = Some(ToolMonitor::new(max_repetitions));
+    }
+
+    /// Reset the retry attempts counter to 0
+    pub async fn reset_retry_attempts(&self) {
+        self.retry_manager.reset_attempts().await;
+    }
+
+    /// Increment the retry attempts counter and return the new value
+    pub async fn increment_retry_attempts(&self) -> u32 {
+        self.retry_manager.increment_attempts().await
+    }
+
+    /// Get the current retry attempts count
+    pub async fn get_retry_attempts(&self) -> u32 {
+        self.retry_manager.get_attempts().await
+    }
+
+    /// Handle retry logic for the agent reply loop
+    async fn handle_retry_logic(
+        &self,
+        messages: &mut Conversation,
+        session: &Option<SessionConfig>,
+        initial_messages: &[Message],
+    ) -> Result<bool> {
+        let result = self
+            .retry_manager
+            .handle_retry_logic(messages, session, initial_messages, &self.final_output_tool)
+            .await?;
+
+        match result {
+            RetryResult::Retried => Ok(true),
+            RetryResult::Skipped
+            | RetryResult::MaxAttemptsReached
+            | RetryResult::SuccessChecksPassed => Ok(false),
+        }
+    }
+
+    async fn prepare_reply_context(
+        &self,
+        unfixed_conversation: Conversation,
+        session: &Option<SessionConfig>,
+    ) -> Result<ReplyContext> {
+        let unfixed_messages = unfixed_conversation.messages().clone();
+        let (conversation, issues) = fix_conversation(unfixed_conversation.clone());
+        if !issues.is_empty() {
+            tracing::warn!(
+                "Conversation issue fixed: {}",
+                debug_conversation_fix(
+                    unfixed_messages.as_slice(),
+                    conversation.messages(),
+                    &issues
+                )
+            );
+        }
+        let initial_messages = conversation.messages().clone();
+        let config = Config::global();
+
+        let (tools, toolshim_tools, system_prompt) = self.prepare_tools_and_prompt().await?;
+        let goose_mode = Self::determine_goose_mode(session.as_ref(), config);
+
+        Ok(ReplyContext {
+            messages: conversation,
+            tools,
+            toolshim_tools,
+            system_prompt,
+            goose_mode,
+            initial_messages,
+            config,
+        })
+    }
+
+    async fn categorize_tools(
+        &self,
+        response: &Message,
+        tools: &[rmcp::model::Tool],
+    ) -> ToolCategorizeResult {
+        let (readonly_tools, regular_tools) = Self::categorize_tools_by_annotation(tools);
+
+        // Categorize tool requests
+        let (frontend_requests, remaining_requests, filtered_response) =
+            self.categorize_tool_requests(response).await;
+
+        ToolCategorizeResult {
+            frontend_requests,
+            remaining_requests,
+            filtered_response,
+            readonly_tools,
+            regular_tools,
+        }
+    }
+
+    async fn handle_approved_and_denied_tools(
+        &self,
+        permission_check_result: &PermissionCheckResult,
+        message_tool_response: Arc<Mutex<Message>>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Vec<(String, ToolStream)>> {
+        let mut tool_futures: Vec<(String, ToolStream)> = Vec::new();
+
+        // Handle pre-approved and read-only tools
+        for request in &permission_check_result.approved {
+            if let Ok(tool_call) = request.tool_call.clone() {
+                let (req_id, tool_result) = self
+                    .dispatch_tool_call(tool_call, request.id.clone(), cancel_token.clone())
+                    .await;
+
+                tool_futures.push((
+                    req_id,
+                    match tool_result {
+                        Ok(result) => tool_stream(
+                            result
+                                .notification_stream
+                                .unwrap_or_else(|| Box::new(stream::empty())),
+                            result.result,
+                        ),
+                        Err(e) => {
+                            tool_stream(Box::new(stream::empty()), futures::future::ready(Err(e)))
+                        }
+                    },
+                ));
+            }
+        }
+
+        // Handle denied tools
+        for request in &permission_check_result.denied {
+            let mut response = message_tool_response.lock().await;
+            *response = response.clone().with_tool_response(
+                request.id.clone(),
+                Ok(vec![rmcp::model::Content::text(DECLINED_RESPONSE)]),
+            );
+        }
+
+        Ok(tool_futures)
+    }
+
+    /// Set the scheduler service for this agent
+    pub async fn set_scheduler(&self, scheduler: Arc<dyn SchedulerTrait>) {
+        let mut scheduler_service = self.scheduler_service.lock().await;
+        *scheduler_service = Some(scheduler);
+    }
+
+    pub async fn disable_router_for_recipe(&self) {
+        self.tool_route_manager.disable_router_for_recipe().await;
+    }
+
     /// Get a reference count clone to the provider
     pub async fn provider(&self) -> Result<Arc<dyn Provider>, anyhow::Error> {
         match &*self.provider.lock().await {
@@ -175,22 +342,17 @@ impl Agent {
         self.frontend_tools.lock().await.get(name).cloned()
     }
 
-    /// Get all tools from all clients with proper prefixing
-    pub async fn get_prefixed_tools(&self) -> ExtensionResult<Vec<Tool>> {
-        let mut tools = self
-            .extension_manager
-            .lock()
-            .await
-            .get_prefixed_tools(None)
-            .await?;
+    pub async fn add_final_output_tool(&self, response: Response) {
+        let mut final_output_tool = self.final_output_tool.lock().await;
+        let created_final_output_tool = FinalOutputTool::new(response);
+        let final_output_system_prompt = created_final_output_tool.system_prompt();
+        *final_output_tool = Some(created_final_output_tool);
+        self.extend_system_prompt(final_output_system_prompt).await;
+    }
 
-        // Add frontend tools directly - they don't need prefixing since they're already uniquely named
-        let frontend_tools = self.frontend_tools.lock().await;
-        for frontend_tool in frontend_tools.values() {
-            tools.push(frontend_tool.tool.clone());
-        }
-
-        Ok(tools)
+    pub async fn add_sub_recipes(&self, sub_recipes: Vec<SubRecipe>) {
+        let mut sub_recipe_manager = self.sub_recipe_manager.lock().await;
+        sub_recipe_manager.add_sub_recipe_tools(sub_recipes);
     }
 
     /// Dispatch a single tool call to the appropriate client
@@ -199,6 +361,7 @@ impl Agent {
         &self,
         tool_call: mcp_core::tool::ToolCall,
         request_id: String,
+        cancellation_token: Option<CancellationToken>,
     ) -> (String, Result<ToolCallResult, ToolError>) {
         // Check if this tool call should be allowed based on repetition monitoring
         if let Some(monitor) = self.tool_monitor.lock().await.as_mut() {
@@ -241,18 +404,60 @@ impl Agent {
             return (request_id, Ok(ToolCallResult::from(result)));
         }
 
-        let extension_manager = self.extension_manager.lock().await;
-        let result: ToolCallResult = if tool_call.name == PLATFORM_READ_RESOURCE_TOOL_NAME {
+        if tool_call.name == FINAL_OUTPUT_TOOL_NAME {
+            return if let Some(final_output_tool) = self.final_output_tool.lock().await.as_mut() {
+                let result = final_output_tool.execute_tool_call(tool_call.clone()).await;
+                (request_id, Ok(result))
+            } else {
+                (
+                    request_id,
+                    Err(ToolError::ExecutionError(
+                        "Final output tool not defined".to_string(),
+                    )),
+                )
+            };
+        }
+
+        let extension_manager = self.extension_manager.read().await;
+        let sub_recipe_manager = self.sub_recipe_manager.lock().await;
+        let result: ToolCallResult = if sub_recipe_manager.is_sub_recipe_tool(&tool_call.name) {
+            sub_recipe_manager
+                .dispatch_sub_recipe_tool_call(
+                    &tool_call.name,
+                    tool_call.arguments.clone(),
+                    &self.tasks_manager,
+                )
+                .await
+        } else if tool_call.name == SUBAGENT_EXECUTE_TASK_TOOL_NAME {
+            let provider = self.provider().await.ok();
+
+            let task_config = TaskConfig::new(provider);
+            subagent_execute_task_tool::run_tasks(
+                tool_call.arguments.clone(),
+                task_config,
+                &self.tasks_manager,
+                cancellation_token,
+            )
+            .await
+        } else if tool_call.name == DYNAMIC_TASK_TOOL_NAME_PREFIX {
+            create_dynamic_task(tool_call.arguments.clone(), &self.tasks_manager).await
+        } else if tool_call.name == PLATFORM_READ_RESOURCE_TOOL_NAME {
             // Check if the tool is read_resource and handle it separately
             ToolCallResult::from(
                 extension_manager
-                    .read_resource(tool_call.arguments.clone())
+                    .read_resource(
+                        tool_call.arguments.clone(),
+                        cancellation_token.unwrap_or_default(),
+                    )
                     .await,
             )
         } else if tool_call.name == PLATFORM_LIST_RESOURCES_TOOL_NAME {
             ToolCallResult::from(
                 extension_manager
-                    .list_resources(tool_call.arguments.clone())
+                    .list_resources(
+                        tool_call.arguments.clone(),
+                        cancellation_token.unwrap_or_default(),
+                    )
                     .await,
             )
         } else if tool_call.name == PLATFORM_SEARCH_AVAILABLE_EXTENSIONS_TOOL_NAME {
@@ -265,39 +470,22 @@ impl Agent {
         } else if tool_call.name == ROUTER_VECTOR_SEARCH_TOOL_NAME
             || tool_call.name == ROUTER_LLM_SEARCH_TOOL_NAME
         {
-            let selector = self.router_tool_selector.lock().await.clone();
-            let selected_tools = match selector.as_ref() {
-                Some(selector) => match selector.select_tools(tool_call.arguments.clone()).await {
-                    Ok(tools) => tools,
-                    Err(e) => {
-                        return (
-                            request_id,
-                            Err(ToolError::ExecutionError(format!(
-                                "Failed to select tools: {}",
-                                e
-                            ))),
-                        )
-                    }
-                },
-                None => {
-                    return (
-                        request_id,
-                        Err(ToolError::ExecutionError(
-                            "No tool selector available".to_string(),
-                        )),
-                    )
-                }
-            };
-            ToolCallResult::from(Ok(selected_tools))
+            match self
+                .tool_route_manager
+                .dispatch_route_search_tool(tool_call.arguments)
+                .await
+            {
+                Ok(tool_result) => tool_result,
+                Err(e) => return (request_id, Err(e)),
+            }
         } else {
             // Clone the result to ensure no references to extension_manager are returned
             let result = extension_manager
-                .dispatch_tool_call(tool_call.clone())
+                .dispatch_tool_call(tool_call.clone(), cancellation_token.unwrap_or_default())
                 .await;
-            match result {
-                Ok(call_result) => call_result,
-                Err(e) => ToolCallResult::from(Err(ToolError::ExecutionError(e.to_string()))),
-            }
+            result.unwrap_or_else(|e| {
+                ToolCallResult::from(Err(ToolError::ExecutionError(e.to_string())))
+            })
         };
 
         (
@@ -319,13 +507,11 @@ impl Agent {
         extension_name: String,
         request_id: String,
     ) -> (String, Result<Vec<Content>, ToolError>) {
-        let mut extension_manager = self.extension_manager.lock().await;
-
-        let selector = self.router_tool_selector.lock().await.clone();
+        let selector = self.tool_route_manager.get_router_tool_selector().await;
         if ToolRouterIndexManager::is_tool_router_enabled(&selector) {
             if let Some(selector) = selector {
                 let selector_action = if action == "disable" { "remove" } else { "add" };
-                let extension_manager = self.extension_manager.lock().await;
+                let extension_manager = self.extension_manager.read().await;
                 let selector = Arc::new(selector);
                 if let Err(e) = ToolRouterIndexManager::update_extension_tools(
                     &selector,
@@ -345,7 +531,7 @@ impl Agent {
                 }
             }
         }
-
+        let mut extension_manager = self.extension_manager.write().await;
         if action == "disable" {
             let result = extension_manager
                 .remove_extension(&extension_name)
@@ -381,7 +567,6 @@ impl Agent {
                 )
             }
         };
-
         let result = extension_manager
             .add_extension(config)
             .await
@@ -393,6 +578,34 @@ impl Agent {
             })
             .map_err(|e| ToolError::ExecutionError(e.to_string()));
 
+        drop(extension_manager);
+        // Update vector index if operation was successful and vector routing is enabled
+        if result.is_ok() {
+            let selector = self.tool_route_manager.get_router_tool_selector().await;
+            if ToolRouterIndexManager::is_tool_router_enabled(&selector) {
+                if let Some(selector) = selector {
+                    let vector_action = if action == "disable" { "remove" } else { "add" };
+                    let extension_manager = self.extension_manager.read().await;
+                    let selector = Arc::new(selector);
+                    if let Err(e) = ToolRouterIndexManager::update_extension_tools(
+                        &selector,
+                        &extension_manager,
+                        &extension_name,
+                        vector_action,
+                    )
+                    .await
+                    {
+                        return (
+                            request_id,
+                            Err(ToolError::ExecutionError(format!(
+                                "Failed to update vector index: {}",
+                                e
+                            ))),
+                        );
+                    }
+                }
+            }
+        }
         (request_id, result)
     }
 
@@ -408,10 +621,10 @@ impl Agent {
                 let mut frontend_tools = self.frontend_tools.lock().await;
                 for tool in tools {
                     let frontend_tool = FrontendTool {
-                        name: tool.name.clone(),
+                        name: tool.name.to_string(),
                         tool: tool.clone(),
                     };
-                    frontend_tools.insert(tool.name.clone(), frontend_tool);
+                    frontend_tools.insert(tool.name.to_string(), frontend_tool);
                 }
                 // Store instructions if provided, using "frontend" as the key
                 let mut frontend_instructions = self.frontend_instructions.lock().await;
@@ -425,16 +638,16 @@ impl Agent {
                 }
             }
             _ => {
-                let mut extension_manager = self.extension_manager.lock().await;
+                let mut extension_manager = self.extension_manager.write().await;
                 extension_manager.add_extension(extension.clone()).await?;
             }
         }
 
         // If vector tool selection is enabled, index the tools
-        let selector = self.router_tool_selector.lock().await.clone();
+        let selector = self.tool_route_manager.get_router_tool_selector().await;
         if ToolRouterIndexManager::is_tool_router_enabled(&selector) {
             if let Some(selector) = selector {
-                let extension_manager = self.extension_manager.lock().await;
+                let extension_manager = self.extension_manager.read().await;
                 let selector = Arc::new(selector);
                 if let Err(e) = ToolRouterIndexManager::update_extension_tools(
                     &selector,
@@ -457,7 +670,7 @@ impl Agent {
     }
 
     pub async fn list_tools(&self, extension_name: Option<String>) -> Vec<Tool> {
-        let extension_manager = self.extension_manager.lock().await;
+        let extension_manager = self.extension_manager.read().await;
         let mut prefixed_tools = extension_manager
             .get_prefixed_tools(extension_name.clone())
             .await
@@ -465,15 +678,32 @@ impl Agent {
 
         if extension_name.is_none() || extension_name.as_deref() == Some("platform") {
             // Add platform tools
-            prefixed_tools.push(platform_tools::search_available_extensions_tool());
-            prefixed_tools.push(platform_tools::manage_extensions_tool());
-            prefixed_tools.push(platform_tools::manage_schedule_tool());
+            prefixed_tools.extend([
+                platform_tools::search_available_extensions_tool(),
+                platform_tools::manage_extensions_tool(),
+                platform_tools::manage_schedule_tool(),
+            ]);
+
+            // Dynamic task tool
+            prefixed_tools.push(create_dynamic_task_tool());
 
             // Add resource tools if supported
             if extension_manager.supports_resources() {
-                prefixed_tools.push(platform_tools::read_resource_tool());
-                prefixed_tools.push(platform_tools::list_resources_tool());
+                prefixed_tools.extend([
+                    platform_tools::read_resource_tool(),
+                    platform_tools::list_resources_tool(),
+                ]);
             }
+        }
+
+        if extension_name.is_none() {
+            let sub_recipe_manager = self.sub_recipe_manager.lock().await;
+            prefixed_tools.extend(sub_recipe_manager.sub_recipe_tools.values().cloned());
+
+            if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
+                prefixed_tools.push(final_output_tool.tool());
+            }
+            prefixed_tools.push(subagent_execute_task_tool::create_subagent_execute_task_tool());
         }
 
         prefixed_tools
@@ -483,46 +713,21 @@ impl Agent {
         &self,
         strategy: Option<RouterToolSelectionStrategy>,
     ) -> Vec<Tool> {
-        let mut prefixed_tools = vec![];
-        match strategy {
-            Some(RouterToolSelectionStrategy::Vector) => {
-                prefixed_tools.push(router_tools::vector_search_tool());
-            }
-            Some(RouterToolSelectionStrategy::Llm) => {
-                prefixed_tools.push(router_tools::llm_search_tool());
-            }
-            None => {}
-        }
-
-        // Get recent tool calls from router tool selector if available
-        let selector = self.router_tool_selector.lock().await.clone();
-        if let Some(selector) = selector {
-            if let Ok(recent_calls) = selector.get_recent_tool_calls(20).await {
-                let extension_manager = self.extension_manager.lock().await;
-                // Add recent tool calls to the list, avoiding duplicates
-                for tool_name in recent_calls {
-                    // Find the tool in the extension manager's tools
-                    if let Ok(extension_tools) = extension_manager.get_prefixed_tools(None).await {
-                        if let Some(tool) = extension_tools.iter().find(|t| t.name == tool_name) {
-                            // Only add if not already in prefixed_tools
-                            if !prefixed_tools.iter().any(|t| t.name == tool.name) {
-                                prefixed_tools.push(tool.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        prefixed_tools
+        self.tool_route_manager
+            .list_tools_for_router(strategy, &self.extension_manager)
+            .await
     }
 
     pub async fn remove_extension(&self, name: &str) -> Result<()> {
+        let mut extension_manager = self.extension_manager.write().await;
+        extension_manager.remove_extension(name).await?;
+        drop(extension_manager);
+
         // If vector tool selection is enabled, remove tools from the index
-        let selector = self.router_tool_selector.lock().await.clone();
+        let selector = self.tool_route_manager.get_router_tool_selector().await;
         if ToolRouterIndexManager::is_tool_router_enabled(&selector) {
             if let Some(selector) = selector {
-                let extension_manager = self.extension_manager.lock().await;
+                let extension_manager = self.extension_manager.read().await;
                 ToolRouterIndexManager::update_extension_tools(
                     &selector,
                     &extension_manager,
@@ -533,14 +738,11 @@ impl Agent {
             }
         }
 
-        let mut extension_manager = self.extension_manager.lock().await;
-        extension_manager.remove_extension(name).await?;
-
         Ok(())
     }
 
     pub async fn list_extensions(&self) -> Vec<String> {
-        let extension_manager = self.extension_manager.lock().await;
+        let extension_manager = self.extension_manager.read().await;
         extension_manager
             .list_extensions()
             .await
@@ -558,44 +760,111 @@ impl Agent {
         }
     }
 
-    #[instrument(skip(self, messages, session), fields(user_message))]
-    pub async fn reply(
+    /// Handle auto-compaction logic and return compacted messages if needed
+    async fn handle_auto_compaction(
         &self,
         messages: &[Message],
-        session: Option<SessionConfig>,
-    ) -> anyhow::Result<BoxStream<'_, anyhow::Result<AgentEvent>>> {
-        let mut messages = messages.to_vec();
-        let reply_span = tracing::Span::current();
-
-        // Load settings from config
-        let config = Config::global();
-
-        // Setup tools and prompt
-        let (mut tools, mut toolshim_tools, mut system_prompt) =
-            self.prepare_tools_and_prompt().await?;
-
-        // Get goose_mode from config, but override with execution_mode if provided in session config
-        let mut goose_mode = config.get_param("GOOSE_MODE").unwrap_or("auto".to_string());
-
-        // If this is a scheduled job with an execution_mode, override the goose_mode
-        if let Some(session_config) = &session {
-            if let Some(execution_mode) = &session_config.execution_mode {
-                // Map "foreground" to "auto" and "background" to "chat"
-                goose_mode = match execution_mode.as_str() {
-                    "foreground" => "auto".to_string(),
-                    "background" => "chat".to_string(),
-                    _ => goose_mode,
-                };
-                tracing::info!(
-                    "Using execution_mode '{}' which maps to goose_mode '{}'",
-                    execution_mode,
-                    goose_mode
-                );
+        session: &Option<SessionConfig>,
+    ) -> Result<Option<(Conversation, String)>> {
+        // Try to get session metadata for more accurate token counts
+        let session_metadata = if let Some(session_config) = session {
+            match session::storage::get_path(session_config.id.clone()) {
+                Ok(session_file_path) => session::storage::read_metadata(&session_file_path).ok(),
+                Err(_) => None,
             }
+        } else {
+            None
+        };
+
+        let compact_result = auto_compact::check_and_compact_messages(
+            self,
+            messages,
+            None,
+            session_metadata.as_ref(),
+        )
+        .await?;
+
+        if compact_result.compacted {
+            let compacted_messages = compact_result.messages;
+
+            // Create compaction notification message
+            let compaction_msg = if let (Some(before), Some(after)) =
+                (compact_result.tokens_before, compact_result.tokens_after)
+            {
+                format!(
+                    "Auto-compacted context: {} → {} tokens ({:.0}% reduction)\n\n",
+                    before,
+                    after,
+                    (1.0 - (after as f64 / before as f64)) * 100.0
+                )
+            } else {
+                "Auto-compacted context to reduce token usage\n\n".to_string()
+            };
+
+            return Ok(Some((compacted_messages, compaction_msg)));
         }
 
-        let (tools_with_readonly_annotation, tools_without_annotation) =
-            Self::categorize_tools_by_annotation(&tools);
+        Ok(None)
+    }
+
+    #[instrument(skip(self, unfixed_conversation, session), fields(user_message))]
+    pub async fn reply(
+        &self,
+        unfixed_conversation: Conversation,
+        session: Option<SessionConfig>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
+        // Handle auto-compaction before processing
+        let (messages, compaction_msg) = match self
+            .handle_auto_compaction(unfixed_conversation.messages(), &session)
+            .await?
+        {
+            Some((compacted_messages, msg)) => (compacted_messages, Some(msg)),
+            None => {
+                let context = self
+                    .prepare_reply_context(unfixed_conversation, &session)
+                    .await?;
+                (context.messages, None)
+            }
+        };
+
+        // If we compacted, yield the compaction message and history replacement event
+        if let Some(compaction_msg) = compaction_msg {
+            return Ok(Box::pin(async_stream::try_stream! {
+                yield AgentEvent::Message(Message::assistant().with_text(compaction_msg));
+                yield AgentEvent::HistoryReplaced(messages.messages().clone());
+
+                // Continue with normal reply processing using compacted messages
+                let mut reply_stream = self.reply_internal(messages, session, cancel_token).await?;
+                while let Some(event) = reply_stream.next().await {
+                    yield event?;
+                }
+            }));
+        }
+
+        // No compaction needed, proceed with normal processing
+        self.reply_internal(messages, session, cancel_token).await
+    }
+
+    /// Main reply method that handles the actual agent processing
+    async fn reply_internal(
+        &self,
+        messages: Conversation,
+        session: Option<SessionConfig>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
+        let context = self.prepare_reply_context(messages, &session).await?;
+        let ReplyContext {
+            mut messages,
+            mut tools,
+            mut toolshim_tools,
+            mut system_prompt,
+            goose_mode,
+            initial_messages,
+            config,
+        } = context;
+        let reply_span = tracing::Span::current();
+        self.reset_retry_attempts().await;
 
         if let Some(content) = messages
             .last()
@@ -607,230 +876,280 @@ impl Agent {
 
         Ok(Box::pin(async_stream::try_stream! {
             let _ = reply_span.enter();
+            let mut turns_taken = 0u32;
+            let max_turns = session
+                .as_ref()
+                .and_then(|s| s.max_turns)
+                .unwrap_or_else(|| {
+                    config.get_param("GOOSE_MAX_TURNS").unwrap_or(DEFAULT_MAX_TURNS)
+                });
+
             loop {
-                match Self::generate_response_from_provider(
-                    self.provider().await?,
-                    &system_prompt,
-                    &messages,
-                    &tools,
-                    &toolshim_tools,
-                ).await {
-                    Ok((response, usage)) => {
-                        // Emit model change event if provider is lead-worker
-                        let provider = self.provider().await?;
-                        if let Some(lead_worker) = provider.as_lead_worker() {
-                            // The actual model used is in the usage
-                            let active_model = usage.model.clone();
-                            let (lead_model, worker_model) = lead_worker.get_model_info();
-                            let mode = if active_model == lead_model {
-                                "lead"
-                            } else if active_model == worker_model {
-                                "worker"
-                            } else {
-                                "unknown"
-                            };
+                if is_token_cancelled(&cancel_token) {
+                    break;
+                }
 
-                            yield AgentEvent::ModelChange {
-                                model: active_model,
-                                mode: mode.to_string(),
-                            };
-                        }
-
-                        // record usage for the session in the session file
-                        if let Some(session_config) = session.clone() {
-                            Self::update_session_metrics(session_config, &usage, messages.len()).await?;
-                        }
-
-                        // categorize the type of requests we need to handle
-                        let (frontend_requests,
-                            remaining_requests,
-                            filtered_response) =
-                            self.categorize_tool_requests(&response).await;
-
-                        // Record tool calls in the router selector
-                        let selector = self.router_tool_selector.lock().await.clone();
-                        if let Some(selector) = selector {
-                            // Record frontend tool calls
-                            for request in &frontend_requests {
-                                if let Ok(tool_call) = &request.tool_call {
-                                    if let Err(e) = selector.record_tool_call(&tool_call.name).await {
-                                        tracing::error!("Failed to record frontend tool call: {}", e);
-                                    }
-                                }
-                            }
-                            // Record remaining tool calls
-                            for request in &remaining_requests {
-                                if let Ok(tool_call) = &request.tool_call {
-                                    if let Err(e) = selector.record_tool_call(&tool_call.name).await {
-                                        tracing::error!("Failed to record tool call: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                        // Yield the assistant's response with frontend tool requests filtered out
-                        yield AgentEvent::Message(filtered_response.clone());
-
-                        tokio::task::yield_now().await;
-
-                        let num_tool_requests = frontend_requests.len() + remaining_requests.len();
-                        if num_tool_requests == 0 {
-                            break;
-                        }
-
-                        // Process tool requests depending on frontend tools and then goose_mode
-                        let message_tool_response = Arc::new(Mutex::new(Message::user()));
-
-                        // First handle any frontend tool requests
-                        let mut frontend_tool_stream = self.handle_frontend_tool_requests(
-                            &frontend_requests,
-                            message_tool_response.clone()
+                if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
+                    if final_output_tool.final_output.is_some() {
+                        let final_event = AgentEvent::Message(
+                            Message::assistant().with_text(final_output_tool.final_output.clone().unwrap()),
                         );
-
-                        // we have a stream of frontend tools to handle, inside the stream
-                        // execution is yeield back to this reply loop, and is of the same Message
-                        // type, so we can yield that back up to be handled
-                        while let Some(msg) = frontend_tool_stream.try_next().await? {
-                            yield AgentEvent::Message(msg);
-                        }
-
-                        // Clone goose_mode once before the match to avoid move issues
-                        let mode = goose_mode.clone();
-                        if mode.as_str() == "chat" {
-                            // Skip all tool calls in chat mode
-                            for request in remaining_requests {
-                                let mut response = message_tool_response.lock().await;
-                                *response = response.clone().with_tool_response(
-                                    request.id.clone(),
-                                    Ok(vec![Content::text(CHAT_MODE_TOOL_SKIPPED_RESPONSE)]),
-                                );
-                            }
-                        } else {
-                            // At this point, we have handled the frontend tool requests and know goose_mode != "chat"
-                            // What remains is handling the remaining tool requests (enable extension,
-                            // regular tool calls) in goose_mode == ["auto", "approve" or "smart_approve"]
-                            let mut permission_manager = PermissionManager::default();
-                            let (permission_check_result, enable_extension_request_ids) = check_tool_permissions(
-                                &remaining_requests,
-                                &mode,
-                                tools_with_readonly_annotation.clone(),
-                                tools_without_annotation.clone(),
-                                &mut permission_manager,
-                                self.provider().await?).await;
-
-                            // Handle pre-approved and read-only tools in parallel
-                            let mut tool_futures: Vec<(String, ToolStream)> = Vec::new();
-
-                            // Skip the confirmation for approved tools
-                            for request in &permission_check_result.approved {
-                                if let Ok(tool_call) = request.tool_call.clone() {
-                                    let (req_id, tool_result) = self.dispatch_tool_call(tool_call, request.id.clone()).await;
-
-                                    tool_futures.push((req_id, match tool_result {
-                                        Ok(result) => tool_stream(
-                                            result.notification_stream.unwrap_or_else(|| Box::new(stream::empty())),
-                                            result.result,
-                                        ),
-                                        Err(e) => tool_stream(
-                                            Box::new(stream::empty()),
-                                            futures::future::ready(Err(e)),
-                                        ),
-                                    }));
-                                }
-                            }
-
-                            for request in &permission_check_result.denied {
-                                let mut response = message_tool_response.lock().await;
-                                *response = response.clone().with_tool_response(
-                                    request.id.clone(),
-                                    Ok(vec![Content::text(DECLINED_RESPONSE)]),
-                                );
-                            }
-
-                            // We need interior mutability in handle_approval_tool_requests
-                            let tool_futures_arc = Arc::new(Mutex::new(tool_futures));
-
-                            // Process tools requiring approval (enable extension, regular tool calls)
-                            let mut tool_approval_stream = self.handle_approval_tool_requests(
-                                &permission_check_result.needs_approval,
-                                tool_futures_arc.clone(),
-                                &mut permission_manager,
-                                message_tool_response.clone()
-                            );
-
-                            // We have a stream of tool_approval_requests to handle
-                            // Execution is yielded back to this reply loop, and is of the same Message
-                            // type, so we can yield the Message back up to be handled and grab any
-                            // confirmations or denials
-                            while let Some(msg) = tool_approval_stream.try_next().await? {
-                                yield AgentEvent::Message(msg);
-                            }
-
-                            tool_futures = {
-                                // Lock the mutex asynchronously
-                                let mut futures_lock = tool_futures_arc.lock().await;
-                                // Drain the vector and collect into a new Vec
-                                futures_lock.drain(..).collect::<Vec<_>>()
-                            };
-
-                            let with_id = tool_futures
-                                .into_iter()
-                                .map(|(request_id, stream)| {
-                                    stream.map(move |item| (request_id.clone(), item))
-                                })
-                                .collect::<Vec<_>>();
-
-                            let mut combined = stream::select_all(with_id);
-
-                            let mut all_install_successful = true;
-
-                            while let Some((request_id, item)) = combined.next().await {
-                                match item {
-                                    ToolStreamItem::Result(output) => {
-                                        if enable_extension_request_ids.contains(&request_id) && output.is_err(){
-                                            all_install_successful = false;
-                                        }
-                                        let mut response = message_tool_response.lock().await;
-                                        *response = response.clone().with_tool_response(request_id, output);
-                                    },
-                                    ToolStreamItem::Message(msg) => {
-                                        yield AgentEvent::McpNotification((request_id, msg))
-                                    }
-                                }
-                            }
-
-                            // Update system prompt and tools if installations were successful
-                            if all_install_successful {
-                                (tools, toolshim_tools, system_prompt) = self.prepare_tools_and_prompt().await?;
-                            }
-                        }
-
-                        let final_message_tool_resp = message_tool_response.lock().await.clone();
-                        yield AgentEvent::Message(final_message_tool_resp.clone());
-
-                        messages.push(response);
-                        messages.push(final_message_tool_resp);
-                    },
-                    Err(ProviderError::ContextLengthExceeded(_)) => {
-                        // At this point, the last message should be a user message
-                        // because call to provider led to context length exceeded error
-                        // Immediately yield a special message and break
-                        yield AgentEvent::Message(Message::assistant().with_context_length_exceeded(
-                            "The context length of the model has been exceeded. Please start a new session and try again.",
-                        ));
-                        break;
-                    },
-                    Err(e) => {
-                        // Create an error message & terminate the stream
-                        error!("Error: {}", e);
-                        yield AgentEvent::Message(Message::assistant().with_text(format!("Ran into this error: {e}.\n\nPlease retry if you think this is a transient or recoverable error.")));
+                        yield final_event;
                         break;
                     }
                 }
 
-                // Yield control back to the scheduler to prevent blocking
+                turns_taken += 1;
+                if turns_taken > max_turns {
+                    yield AgentEvent::Message(Message::assistant().with_text(
+                        "I've reached the maximum number of actions I can do without user input. Would you like me to continue?"
+                    ));
+                    break;
+                }
+
+                let mut stream = Self::stream_response_from_provider(
+                    self.provider().await?,
+                    &system_prompt,
+                    messages.messages(),
+                    &tools,
+                    &toolshim_tools,
+                ).await?;
+
+                let mut added_message = false;
+                let mut messages_to_add = Vec::new();
+                let mut tools_updated = false;
+
+                while let Some(next) = stream.next().await {
+                    if is_token_cancelled(&cancel_token) {
+                        break;
+                    }
+
+                    match next {
+                        Ok((response, usage)) => {
+                            // Emit model change event if provider is lead-worker
+                            let provider = self.provider().await?;
+                            if let Some(lead_worker) = provider.as_lead_worker() {
+                                if let Some(ref usage) = usage {
+                                    let active_model = usage.model.clone();
+                                    let (lead_model, worker_model) = lead_worker.get_model_info();
+                                    let mode = if active_model == lead_model {
+                                        "lead"
+                                    } else if active_model == worker_model {
+                                        "worker"
+                                    } else {
+                                        "unknown"
+                                    };
+
+                                    yield AgentEvent::ModelChange {
+                                        model: active_model,
+                                        mode: mode.to_string(),
+                                    };
+                                }
+                            }
+
+                            // Record usage for the session
+                            if let Some(ref session_config) = &session {
+                                if let Some(ref usage) = usage {
+                                    Self::update_session_metrics(session_config, usage, messages.len())
+                                        .await?;
+                                }
+                            }
+
+                            if let Some(response) = response {
+                                let ToolCategorizeResult {
+                                    frontend_requests,
+                                    remaining_requests,
+                                    filtered_response,
+                                    readonly_tools,
+                                    regular_tools,
+                                } = self.categorize_tools(&response, &tools).await;
+                                let requests_to_record: Vec<ToolRequest> = frontend_requests.iter().chain(remaining_requests.iter()).cloned().collect();
+                                self.tool_route_manager
+                                    .record_tool_requests(&requests_to_record)
+                                    .await;
+
+                                yield AgentEvent::Message(filtered_response.clone());
+                                tokio::task::yield_now().await;
+
+                                let num_tool_requests = frontend_requests.len() + remaining_requests.len();
+                                if num_tool_requests == 0 {
+                                    continue;
+                                }
+
+                                let message_tool_response = Arc::new(Mutex::new(Message::user().with_id(
+                                    format!("msg_{}", Uuid::new_v4())
+                                )));
+
+                                let mut frontend_tool_stream = self.handle_frontend_tool_requests(
+                                    &frontend_requests,
+                                    message_tool_response.clone(),
+                                );
+
+                                while let Some(msg) = frontend_tool_stream.try_next().await? {
+                                    yield AgentEvent::Message(msg);
+                                }
+
+                                let mode = goose_mode.clone();
+                                if mode.as_str() == "chat" {
+                                    // Skip all tool calls in chat mode
+                                    for request in remaining_requests {
+                                        let mut response = message_tool_response.lock().await;
+                                        *response = response.clone().with_tool_response(
+                                            request.id.clone(),
+                                            Ok(vec![Content::text(CHAT_MODE_TOOL_SKIPPED_RESPONSE)]),
+                                        );
+                                    }
+                                } else {
+                                    let mut permission_manager = PermissionManager::default();
+                                    let (permission_check_result, enable_extension_request_ids) =
+                                        check_tool_permissions(
+                                            &remaining_requests,
+                                            &mode,
+                                            readonly_tools.clone(),
+                                            regular_tools.clone(),
+                                            &mut permission_manager,
+                                            self.provider().await?,
+                                        ).await;
+
+                                    let mut tool_futures = self.handle_approved_and_denied_tools(
+                                        &permission_check_result,
+                                        message_tool_response.clone(),
+                                        cancel_token.clone()
+                                    ).await?;
+
+                                    let tool_futures_arc = Arc::new(Mutex::new(tool_futures));
+
+                                    // Process tools requiring approval
+                                    let mut tool_approval_stream = self.handle_approval_tool_requests(
+                                        &permission_check_result.needs_approval,
+                                        tool_futures_arc.clone(),
+                                        &mut permission_manager,
+                                        message_tool_response.clone(),
+                                        cancel_token.clone(),
+                                    );
+
+                                    while let Some(msg) = tool_approval_stream.try_next().await? {
+                                        yield AgentEvent::Message(msg);
+                                    }
+
+                                    tool_futures = {
+                                        let mut futures_lock = tool_futures_arc.lock().await;
+                                        futures_lock.drain(..).collect::<Vec<_>>()
+                                    };
+
+                                    let with_id = tool_futures
+                                        .into_iter()
+                                        .map(|(request_id, stream)| {
+                                            stream.map(move |item| (request_id.clone(), item))
+                                        })
+                                        .collect::<Vec<_>>();
+
+                                    let mut combined = stream::select_all(with_id);
+                                    let mut all_install_successful = true;
+
+                                    while let Some((request_id, item)) = combined.next().await {
+                                        if is_token_cancelled(&cancel_token) {
+                                            break;
+                                        }
+                                        match item {
+                                            ToolStreamItem::Result(output) => {
+                                                if enable_extension_request_ids.contains(&request_id)
+                                                    && output.is_err()
+                                                {
+                                                    all_install_successful = false;
+                                                }
+                                                let mut response = message_tool_response.lock().await;
+                                                *response =
+                                                    response.clone().with_tool_response(request_id, output);
+                                            }
+                                            ToolStreamItem::Message(msg) => {
+                                                yield AgentEvent::McpNotification((
+                                                    request_id, msg,
+                                                ));
+                                            }
+                                        }
+                                    }
+
+                                    if all_install_successful {
+                                        tools_updated = true;
+                                    }
+                                }
+
+                                let final_message_tool_resp = message_tool_response.lock().await.clone();
+                                yield AgentEvent::Message(final_message_tool_resp.clone());
+
+                                added_message = true;
+                                messages_to_add.push(response);
+                                messages_to_add.push(final_message_tool_resp);
+                            }
+                        }
+                        Err(ProviderError::ContextLengthExceeded(_)) => {
+                            yield AgentEvent::Message(Message::assistant().with_context_length_exceeded(
+                                    "The context length of the model has been exceeded. Please start a new session and try again.",
+                                ));
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Error: {}", e);
+                            yield AgentEvent::Message(Message::assistant().with_text(
+                                    format!("Ran into this error: {e}.\n\nPlease retry if you think this is a transient or recoverable error.")
+                                ));
+                            break;
+                        }
+                    }
+                }
+                if tools_updated {
+                    (tools, toolshim_tools, system_prompt) = self.prepare_tools_and_prompt().await?;
+                }
+                if !added_message {
+                    if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
+                        if final_output_tool.final_output.is_none() {
+                            tracing::warn!("Final output tool has not been called yet. Continuing agent loop.");
+                            let message = Message::user().with_text(FINAL_OUTPUT_CONTINUATION_MESSAGE);
+                            messages_to_add.push(message.clone());
+                            yield AgentEvent::Message(message);
+                            continue
+                        } else {
+                            let message = Message::assistant().with_text(final_output_tool.final_output.clone().unwrap());
+                            messages_to_add.push(message.clone());
+                            yield AgentEvent::Message(message);
+                        }
+                    }
+
+                    match self.handle_retry_logic(&mut messages, &session, &initial_messages).await {
+                        Ok(should_retry) => {
+                            if should_retry {
+                                info!("Retry logic triggered, restarting agent loop");
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Retry logic failed: {}", e);
+                            yield AgentEvent::Message(Message::assistant().with_text(
+                                format!("Retry logic encountered an error: {}", e)
+                            ));
+                        }
+                    }
+                    break;
+                }
+
+                messages.extend(messages_to_add);
+
                 tokio::task::yield_now().await;
             }
         }))
+    }
+
+    fn determine_goose_mode(session: Option<&SessionConfig>, config: &Config) -> String {
+        let mode = session.and_then(|s| s.execution_mode.as_deref());
+
+        match mode {
+            Some("foreground") => "chat".to_string(),
+            Some("background") => "auto".to_string(),
+            _ => config
+                .get_param("GOOSE_MODE")
+                .unwrap_or_else(|_| "auto".to_string()),
+        }
     }
 
     /// Extend the system prompt with one line of additional instruction
@@ -839,9 +1158,10 @@ impl Agent {
         prompt_manager.add_system_prompt_extra(instruction);
     }
 
-    /// Update the provider used by this agent
     pub async fn update_provider(&self, provider: Arc<dyn Provider>) -> Result<()> {
-        *self.provider.lock().await = Some(provider.clone());
+        let mut current_provider = self.provider.lock().await;
+        *current_provider = Some(provider.clone());
+
         self.update_router_tool_selector(Some(provider), None)
             .await?;
         Ok(())
@@ -852,66 +1172,15 @@ impl Agent {
         provider: Option<Arc<dyn Provider>>,
         reindex_all: Option<bool>,
     ) -> Result<()> {
-        let config = Config::global();
-        let extension_manager = self.extension_manager.lock().await;
         let provider = match provider {
             Some(p) => p,
             None => self.provider().await?,
         };
 
-        let router_tool_selection_strategy = config
-            .get_param("GOOSE_ROUTER_TOOL_SELECTION_STRATEGY")
-            .unwrap_or_else(|_| "default".to_string());
-
-        let strategy = match router_tool_selection_strategy.to_lowercase().as_str() {
-            "vector" => Some(RouterToolSelectionStrategy::Vector),
-            "llm" => Some(RouterToolSelectionStrategy::Llm),
-            _ => None,
-        };
-
-        let selector = match strategy {
-            Some(RouterToolSelectionStrategy::Vector) => {
-                let table_name = generate_table_id();
-                let selector = create_tool_selector(strategy, provider.clone(), Some(table_name))
-                    .await
-                    .map_err(|e| anyhow!("Failed to create tool selector: {}", e))?;
-                Arc::new(selector)
-            }
-            Some(RouterToolSelectionStrategy::Llm) => {
-                let selector = create_tool_selector(strategy, provider.clone(), None)
-                    .await
-                    .map_err(|e| anyhow!("Failed to create tool selector: {}", e))?;
-                Arc::new(selector)
-            }
-            None => return Ok(()),
-        };
-
-        // First index platform tools
-        ToolRouterIndexManager::index_platform_tools(&selector, &extension_manager).await?;
-
-        if reindex_all.unwrap_or(false) {
-            let enabled_extensions = extension_manager.list_extensions().await?;
-            for extension_name in enabled_extensions {
-                if let Err(e) = ToolRouterIndexManager::update_extension_tools(
-                    &selector,
-                    &extension_manager,
-                    &extension_name,
-                    "add",
-                )
-                .await
-                {
-                    tracing::error!(
-                        "Failed to index tools for extension {}: {}",
-                        extension_name,
-                        e
-                    );
-                }
-            }
-        }
-
-        // Update the selector
-        *self.router_tool_selector.lock().await = Some(selector.clone());
-        Ok(())
+        // Delegate to ToolRouteManager
+        self.tool_route_manager
+            .update_router_tool_selector(provider, reindex_all, &self.extension_manager)
+            .await
     }
 
     /// Override the system prompt with a custom template
@@ -921,19 +1190,19 @@ impl Agent {
     }
 
     pub async fn list_extension_prompts(&self) -> HashMap<String, Vec<Prompt>> {
-        let extension_manager = self.extension_manager.lock().await;
+        let extension_manager = self.extension_manager.read().await;
         extension_manager
-            .list_prompts()
+            .list_prompts(CancellationToken::default())
             .await
             .expect("Failed to list prompts")
     }
 
     pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<GetPromptResult> {
-        let extension_manager = self.extension_manager.lock().await;
+        let extension_manager = self.extension_manager.read().await;
 
         // First find which extension has this prompt
         let prompts = extension_manager
-            .list_prompts()
+            .list_prompts(CancellationToken::default())
             .await
             .map_err(|e| anyhow!("Failed to list prompts: {}", e))?;
 
@@ -943,7 +1212,7 @@ impl Agent {
             .map(|(extension, _)| extension)
         {
             return extension_manager
-                .get_prompt(extension, name, arguments)
+                .get_prompt(extension, name, arguments, CancellationToken::default())
                 .await
                 .map_err(|e| anyhow!("Failed to get prompt: {}", e));
         }
@@ -951,15 +1220,18 @@ impl Agent {
         Err(anyhow!("Prompt '{}' not found", name))
     }
 
-    pub async fn get_plan_prompt(&self) -> anyhow::Result<String> {
-        let extension_manager = self.extension_manager.lock().await;
+    pub async fn get_plan_prompt(&self) -> Result<String> {
+        let extension_manager = self.extension_manager.read().await;
         let tools = extension_manager.get_prefixed_tools(None).await?;
         let tools_info = tools
             .into_iter()
             .map(|tool| {
                 ToolInfo::new(
                     &tool.name,
-                    &tool.description,
+                    tool.description
+                        .as_ref()
+                        .map(|d| d.as_ref())
+                        .unwrap_or_default(),
                     get_parameter_names(&tool),
                     None,
                 )
@@ -973,12 +1245,12 @@ impl Agent {
 
     pub async fn handle_tool_result(&self, id: String, result: ToolResult<Vec<Content>>) {
         if let Err(e) = self.tool_result_tx.send((id, result)).await {
-            tracing::error!("Failed to send tool result: {}", e);
+            error!("Failed to send tool result: {}", e);
         }
     }
 
-    pub async fn create_recipe(&self, mut messages: Vec<Message>) -> Result<Recipe> {
-        let extension_manager = self.extension_manager.lock().await;
+    pub async fn create_recipe(&self, mut messages: Conversation) -> Result<Recipe> {
+        let extension_manager = self.extension_manager.read().await;
         let extensions_info = extension_manager.get_extensions_info().await;
 
         // Get model name from provider
@@ -1006,7 +1278,7 @@ impl Agent {
             .await
             .as_ref()
             .unwrap()
-            .complete(&system_prompt, &messages, &tools)
+            .complete(&system_prompt, messages.messages(), &tools)
             .await?;
 
         let content = result.as_concat_text();
@@ -1064,7 +1336,7 @@ impl Agent {
                 let activities_text = activities_text.trim();
 
                 // Regex to remove bullet markers or numbers with an optional dot.
-                let bullet_re = Regex::new(r"^[•\-\*\d]+\.?\s*").expect("Invalid regex");
+                let bullet_re = Regex::new(r"^[•\-*\d]+\.?\s*").expect("Invalid regex");
 
                 // Process each line in the activities section.
                 let activities: Vec<String> = activities_text
@@ -1091,7 +1363,7 @@ impl Agent {
             metadata: None,
         };
 
-        // Ideally we'd get the name of the provider we are using from the provider itself
+        // Ideally we'd get the name of the provider we are using from the provider itself,
         // but it doesn't know and the plumbing looks complicated.
         let config = Config::global();
         let provider_name: String = config
@@ -1116,5 +1388,47 @@ impl Agent {
             .expect("valid recipe");
 
         Ok(recipe)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recipe::Response;
+
+    #[tokio::test]
+    async fn test_add_final_output_tool() -> Result<()> {
+        let agent = Agent::new();
+
+        let response = Response {
+            json_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "result": {"type": "string"}
+                }
+            })),
+        };
+
+        agent.add_final_output_tool(response).await;
+
+        let tools = agent.list_tools(None).await;
+        let final_output_tool = tools
+            .iter()
+            .find(|tool| tool.name == FINAL_OUTPUT_TOOL_NAME);
+
+        assert!(
+            final_output_tool.is_some(),
+            "Final output tool should be present after adding"
+        );
+
+        let prompt_manager = agent.prompt_manager.lock().await;
+        let system_prompt =
+            prompt_manager.build_system_prompt(vec![], None, Value::Null, None, None);
+
+        let final_output_tool_ref = agent.final_output_tool.lock().await;
+        let final_output_tool_system_prompt =
+            final_output_tool_ref.as_ref().unwrap().system_prompt();
+        assert!(system_prompt.contains(&final_output_tool_system_prompt));
+        Ok(())
     }
 }

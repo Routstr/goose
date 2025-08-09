@@ -1,7 +1,10 @@
-use crate::message::{Message, MessageContent};
+use crate::conversation::message::{Message, MessageContent};
+use crate::conversation::Conversation;
+use crate::utils::safe_truncate;
 use anyhow::{anyhow, Result};
-use mcp_core::{Content, ResourceContents, Role};
+use rmcp::model::{RawContent, ResourceContents, Role};
 use std::collections::HashSet;
+use std::ops::DerefMut;
 use tracing::{debug, warn};
 
 /// Maximum size for truncated content in characters
@@ -14,7 +17,7 @@ fn handle_oversized_messages(
     token_counts: &[usize],
     context_limit: usize,
     strategy: &dyn TruncationStrategy,
-) -> Result<(Vec<Message>, Vec<usize>), anyhow::Error> {
+) -> Result<(Conversation, Vec<usize>), anyhow::Error> {
     let mut truncated_messages = Vec::new();
     let mut truncated_token_counts = Vec::new();
     let mut any_truncated = false;
@@ -65,7 +68,10 @@ fn handle_oversized_messages(
         );
     }
 
-    Ok((truncated_messages, truncated_token_counts))
+    Ok((
+        Conversation::new_unvalidated(truncated_messages),
+        truncated_token_counts,
+    ))
 }
 
 /// Truncates the content within a message while preserving its structure
@@ -75,11 +81,11 @@ fn truncate_message_content(message: &Message, max_content_size: usize) -> Resul
     for content in &mut new_message.content {
         match content {
             MessageContent::Text(text_content) => {
-                if text_content.text.len() > max_content_size {
+                if text_content.text.chars().count() > max_content_size {
                     let truncated = format!(
                         "{}\n\n[... content truncated from {} to {} characters ...]",
-                        &text_content.text[..max_content_size.min(text_content.text.len())],
-                        text_content.text.len(),
+                        safe_truncate(&text_content.text, max_content_size),
+                        text_content.text.chars().count(),
                         max_content_size
                     );
                     text_content.text = truncated;
@@ -88,27 +94,29 @@ fn truncate_message_content(message: &Message, max_content_size: usize) -> Resul
             MessageContent::ToolResponse(tool_response) => {
                 if let Ok(ref mut result) = tool_response.tool_result {
                     for content_item in result {
-                        if let Content::Text(ref mut text_content) = content_item {
-                            if text_content.text.len() > max_content_size {
+                        if let RawContent::Text(ref mut text_content) = content_item.deref_mut() {
+                            if text_content.text.chars().count() > max_content_size {
                                 let truncated = format!(
                                     "{}\n\n[... tool response truncated from {} to {} characters ...]",
-                                    &text_content.text[..max_content_size.min(text_content.text.len())],
-                                    text_content.text.len(),
+                                    safe_truncate(&text_content.text, max_content_size),
+                                    text_content.text.chars().count(),
                                     max_content_size
                                 );
                                 text_content.text = truncated;
                             }
                         }
                         // Handle Resource content which might contain large text
-                        else if let Content::Resource(ref mut resource_content) = content_item {
+                        else if let RawContent::Resource(ref mut resource_content) =
+                            content_item.deref_mut()
+                        {
                             if let ResourceContents::TextResourceContents { text, .. } =
                                 &mut resource_content.resource
                             {
-                                if text.len() > max_content_size {
+                                if text.chars().count() > max_content_size {
                                     let truncated = format!(
                                         "{}\n\n[... resource content truncated from {} to {} characters ...]",
-                                        &text[..max_content_size.min(text.len())],
-                                        text.len(),
+                                        safe_truncate(text, max_content_size),
+                                        text.chars().count(),
                                         max_content_size
                                     );
                                     *text = truncated;
@@ -138,19 +146,21 @@ fn estimate_message_tokens(message: &Message, estimate_fn: &dyn Fn(&str) -> usiz
             MessageContent::ToolResponse(tool_response) => {
                 if let Ok(ref result) = tool_response.tool_result {
                     for content_item in result {
-                        match content_item {
-                            Content::Text(text_content) => {
+                        match &content_item.raw {
+                            RawContent::Text(text_content) => {
                                 total_tokens += estimate_fn(&text_content.text);
                             }
-                            Content::Resource(resource_content) => {
-                                match &resource_content.resource {
+                            RawContent::Resource(resource) => {
+                                match &resource.resource {
                                     ResourceContents::TextResourceContents { text, .. } => {
                                         total_tokens += estimate_fn(text);
                                     }
                                     _ => total_tokens += 5, // Small overhead for other resource types
                                 }
                             }
-                            _ => total_tokens += 5, // Small overhead for other content types
+                            _ => {
+                                total_tokens += 5; // Small overhead for other content types
+                            }
                         }
                     }
                 }
@@ -174,7 +184,7 @@ pub fn truncate_messages(
     token_counts: &[usize],
     context_limit: usize,
     strategy: &dyn TruncationStrategy,
-) -> Result<(Vec<Message>, Vec<usize>), anyhow::Error> {
+) -> Result<(Conversation, Vec<usize>), anyhow::Error> {
     let mut messages = messages.to_owned();
     let mut token_counts = token_counts.to_owned();
 
@@ -215,7 +225,10 @@ pub fn truncate_messages(
     }
 
     if total_tokens <= context_limit {
-        return Ok((messages, token_counts)); // No truncation needed
+        return Ok((
+            Conversation::new_unvalidated(messages.to_vec()),
+            token_counts.to_vec(),
+        )); // No truncation needed
     }
 
     // Step 2: Determine indices to remove based on strategy
@@ -297,7 +310,10 @@ pub fn truncate_messages(
     }
 
     debug!("Truncation complete. Total tokens: {}", total_tokens);
-    Ok((messages, token_counts))
+    Ok((
+        Conversation::new_unvalidated(messages.to_vec()),
+        token_counts.to_vec(),
+    ))
 }
 
 /// Trait representing a truncation strategy
@@ -372,10 +388,10 @@ impl TruncationStrategy for OldestFirstTruncation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Message;
+    use crate::conversation::message::Message;
     use anyhow::Result;
-    use mcp_core::content::Content;
     use mcp_core::tool::ToolCall;
+    use rmcp::model::Content;
     use serde_json::json;
 
     // Helper function to create a user text message with a specified token count
@@ -417,15 +433,13 @@ mod tests {
         num_pairs: usize,
         tokens: usize,
         remove_last: bool,
-    ) -> (Vec<Message>, Vec<usize>) {
-        let mut messages: Vec<Message> = (0..num_pairs)
-            .flat_map(|i| {
-                vec![
-                    user_text(i * 2, tokens).0,
-                    assistant_text((i * 2) + 1, tokens).0,
-                ]
-            })
-            .collect();
+    ) -> (Conversation, Vec<usize>) {
+        let mut messages = Conversation::new_unvalidated((0..num_pairs).flat_map(|i| {
+            vec![
+                user_text(i * 2, tokens).0,
+                assistant_text((i * 2) + 1, tokens).0,
+            ]
+        }));
 
         if remove_last {
             messages.pop();
@@ -492,13 +506,13 @@ mod tests {
         let context_limit = 25;
 
         let result = truncate_messages(
-            &messages,
+            &messages.messages(),
             &token_counts,
             context_limit,
             &OldestFirstTruncation,
         )?;
 
-        assert_eq!(result.0, messages);
+        assert_eq!(result.0.messages(), messages.messages());
         assert_eq!(result.1, token_counts);
         Ok(())
     }
@@ -576,7 +590,7 @@ mod tests {
         let context_limit = 100; // Exactly matches total tokens
 
         let result = truncate_messages(
-            &messages,
+            &messages.messages(),
             &token_counts,
             context_limit,
             &OldestFirstTruncation,
@@ -591,7 +605,7 @@ mod tests {
         token_counts.push(1);
 
         let result = truncate_messages(
-            &messages,
+            &messages.messages(),
             &token_counts,
             context_limit,
             &OldestFirstTruncation,
@@ -696,7 +710,7 @@ mod tests {
         // Test impossibly small context window
         let (messages, token_counts) = create_messages_with_counts(1, 10, false);
         let result = truncate_messages(
-            &messages,
+            &messages.messages(),
             &token_counts,
             5, // Impossibly small context
             &OldestFirstTruncation,
