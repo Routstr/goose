@@ -90,16 +90,11 @@ fn check_context_length_exceeded(text: &str) -> bool {
         .any(|phrase| text_lower.contains(phrase))
 }
 
-<<<<<<< HEAD
-    println!("response payload: {}", payload);
-
-=======
 #[allow(clippy::cognitive_complexity)]
 pub fn map_http_error_to_provider_error(
     status: StatusCode,
     payload: Option<Value>,
 ) -> ProviderError {
->>>>>>> origin/main
     match status {
         StatusCode::OK => unreachable!("Should not call this function with OK status"),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -108,41 +103,40 @@ pub fn map_http_error_to_provider_error(
                 Status: {}. Response: {:?}", status, payload
             ))
         }
-<<<<<<< HEAD
+
         StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::PAYLOAD_TOO_LARGE => {
             tracing::debug!(
-                "{}", format!("Provider request failed with status: {}. Payload: {:?}", status, payload)
+                "Provider request failed with status: {}. Payload: {:?}", status, payload
             );
-            if let Ok(err_resp) = from_value::<OpenAIErrorResponse>(payload) {
-                let err = err_resp.error;
-                if err.is_context_length_exceeded() {
-                    return Err(ProviderError::ContextLengthExceeded(err.message.unwrap_or("Unknown error".to_string())));
+            
+            if let Some(payload) = payload {
+                // Try to parse as OpenAIErrorResponse first for better error handling
+                if let Ok(err_resp) = from_value::<OpenAIErrorResponse>(payload.clone()) {
+                    let err = err_resp.error;
+                    if err.is_context_length_exceeded() {
+                        return ProviderError::ContextLengthExceeded(err.message.unwrap_or("Unknown error".to_string()));
+                    }
+                    if let Some(required_sats) = err.get_insufficient_balance() {
+                        return ProviderError::InsufficientBalance(required_sats);
+                    }
+                    return ProviderError::RequestFailed(format!("{} (status {})", err, status.as_u16()));
                 }
-                if let Some(required_sats) = err.get_insufficient_balance() {
-                    return Err(ProviderError::InsufficientBalance(required_sats));
-                }
-                return Err(ProviderError::RequestFailed(format!("{} (status {})", err, status.as_u16())));
-=======
-        StatusCode::BAD_REQUEST => {
-            let mut error_msg = "Unknown error".to_string();
-            if let Some(payload) = &payload {
+                
+                // Fallback to simple payload string check
                 let payload_str = payload.to_string();
                 if check_context_length_exceeded(&payload_str) {
                     return ProviderError::ContextLengthExceeded(payload_str);
                 }
-
+                
+                // Try to extract error message from generic error structure
                 if let Some(error) = payload.get("error") {
-                    error_msg = error.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown error")
-                        .to_string();
+                    if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+                        return ProviderError::RequestFailed(format!("Request failed with status: {}. Message: {}", status, message));
+                    }
                 }
->>>>>>> origin/main
             }
-            tracing::debug!(
-                "Provider request failed with status: {}. Payload: {:?}", status, payload
-            );
-            ProviderError::RequestFailed(format!("Request failed with status: {}. Message: {}", status, error_msg))
+            
+            ProviderError::RequestFailed(format!("Request failed with status: {}", status))
         }
         StatusCode::TOO_MANY_REQUESTS => {
             ProviderError::RateLimitExceeded(format!("{:?}", payload))
