@@ -8,7 +8,7 @@ use super::errors::ProviderError;
 use super::retry::ProviderRetry;
 use super::utils::{
     emit_debug_trace, get_model, handle_response_google_compat, handle_response_openai_compat,
-    is_google_model, is_anthropic_model, update_request_for_anthropic,
+    is_google_model, update_request_for_anthropic,
 };
 use crate::conversation::message::Message;
 use crate::impl_provider_default;

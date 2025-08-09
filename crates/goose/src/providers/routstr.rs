@@ -6,15 +6,15 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
+use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage};
 use super::errors::ProviderError;
 use super::formats::openai::{create_request, get_usage, response_to_message};
 use crate::conversation::message::Message;
 use crate::impl_provider_default;
 use crate::model::ModelConfig;
 use crate::providers::utils::{
-    emit_debug_trace, get_model, handle_response_google_compat, handle_response_openai_compat,
-    is_anthropic_model, is_google_model, update_request_for_anthropic, ImageFormat,
+    emit_debug_trace, get_model, handle_response_openai_compat,
+    is_anthropic_model, update_request_for_anthropic, ImageFormat,
 };
 use rmcp::model::Tool;
 
@@ -198,16 +198,9 @@ impl Provider for RoutstrProvider {
         let response = self.post(payload.clone()).await?;
 
         // Parse response
-        let message = response_to_message(response.clone())?;
+        let message = response_to_message(&response)?;
 
-        let usage = match get_usage(&response) {
-            Ok(usage) => usage,
-            Err(ProviderError::UsageError(e)) => {
-                tracing::debug!("Failed to get usage data: {}", e);
-                Usage::default()
-            }
-            Err(e) => return Err(e),
-        };
+        let usage = get_usage(&response);
         let model = get_model(&response);
         emit_debug_trace(&self.model, &payload, &response, &usage);
         Ok((message, ProviderUsage::new(model, usage)))
@@ -217,7 +210,7 @@ impl Provider for RoutstrProvider {
         false
     }
 
-    async fn fetch_supported_models_async(&self) -> Result<Option<Vec<String>>, ProviderError> {
+    async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
         if let Ok(models) = self.get_models_info().await {
             let model_ids = models.data.into_iter().map(|m| m.id.clone()).collect();
             Ok(Some(model_ids))
