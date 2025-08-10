@@ -1944,9 +1944,8 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chrono"
-version = "0.4.41"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c469d952047f47f91b68d1cba3f10d63c11d73e4636f24f08daf0278abf01c4d"
+version = "0.4.39"
+source = "git+https://github.com/chronotope/chrono?tag=v0.4.39#8b863490d88ba098038392c8aa930012ffd0c439"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
@@ -1954,7 +1953,7 @@ dependencies = [
  "num-traits",
  "serde",
  "wasm-bindgen",
- "windows-link",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
