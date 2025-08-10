@@ -13,6 +13,32 @@ use std::path::Path;
 
 use crate::providers::errors::{OpenAIError, ProviderError};
 
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub enum ProviderResponseType {
+    OpenAI,
+    Google,
+}
+
+/// Handle response from different provider types. This function determines the appropriate
+/// error handling and response parsing based on the provider type.
+///
+/// ### Arguments
+/// - `response`: The HTTP response to process.
+/// - `provider_type`: The type of provider (OpenAI, Google, etc.)
+///
+/// ### Returns
+/// - `Ok(Value)`: Parsed JSON on success.
+/// - `Err(ProviderError)`: Describes the failure reason.
+pub async fn handle_provider_response(
+    response: Response,
+    provider_type: ProviderResponseType,
+) -> Result<Value, ProviderError> {
+    match provider_type {
+        ProviderResponseType::OpenAI => handle_response_openai_compat(response).await,
+        ProviderResponseType::Google => handle_response_google_compat(response).await,
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct OpenAIErrorResponse {
     error: OpenAIError,
@@ -77,25 +103,40 @@ pub fn map_http_error_to_provider_error(
                 Status: {}. Response: {:?}", status, payload
             ))
         }
-        StatusCode::BAD_REQUEST => {
-            let mut error_msg = "Unknown error".to_string();
-            if let Some(payload) = &payload {
+
+        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::PAYLOAD_TOO_LARGE => {
+            tracing::debug!(
+                "Provider request failed with status: {}. Payload: {:?}", status, payload
+            );
+
+            if let Some(payload) = payload {
+                // Try to parse as OpenAIErrorResponse first for better error handling
+                if let Ok(err_resp) = from_value::<OpenAIErrorResponse>(payload.clone()) {
+                    let err = err_resp.error;
+                    if err.is_context_length_exceeded() {
+                        return ProviderError::ContextLengthExceeded(err.message.unwrap_or("Unknown error".to_string()));
+                    }
+                    if let Some(required_sats) = err.get_insufficient_balance() {
+                        return ProviderError::InsufficientBalance(required_sats);
+                    }
+                    return ProviderError::RequestFailed(format!("{} (status {})", err, status.as_u16()));
+                }
+
+                // Fallback to simple payload string check
                 let payload_str = payload.to_string();
                 if check_context_length_exceeded(&payload_str) {
                     return ProviderError::ContextLengthExceeded(payload_str);
                 }
 
+                // Try to extract error message from generic error structure
                 if let Some(error) = payload.get("error") {
-                    error_msg = error.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown error")
-                        .to_string();
+                    if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+                        return ProviderError::RequestFailed(format!("Request failed with status: {}. Message: {}", status, message));
+                    }
                 }
             }
-            tracing::debug!(
-                "Provider request failed with status: {}. Payload: {:?}", status, payload
-            );
-            ProviderError::RequestFailed(format!("Request failed with status: {}. Message: {}", status, error_msg))
+
+            ProviderError::RequestFailed(format!("Request failed with status: {}", status))
         }
         StatusCode::TOO_MANY_REQUESTS => {
             ProviderError::RateLimitExceeded(format!("{:?}", payload))
@@ -391,6 +432,85 @@ pub fn unescape_json_values(value: &Value) -> Value {
     }
 }
 
+/// Check if the model is an Anthropic model based on the model name.
+pub fn is_anthropic_model(model_name: &str) -> bool {
+    model_name.starts_with("anthropic")
+}
+
+/// Update the request when using Anthropic model by adding caching controls.
+/// For Anthropic models, we enable prompt caching to save cost. Since we're using
+/// OpenAI compatible endpoints, we need to modify the OpenAI request to have
+/// Anthropic cache control fields.
+pub fn update_request_for_anthropic(original_payload: &Value) -> Value {
+    let mut payload = original_payload.clone();
+
+    if let Some(messages_spec) = payload
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("messages"))
+        .and_then(|messages| messages.as_array_mut())
+    {
+        // Add "cache_control" to the last and second-to-last "user" messages.
+        // During each turn, we mark the final message with cache_control so the conversation can be
+        // incrementally cached. The second-to-last user message is also marked for caching with the
+        // cache_control parameter, so that this checkpoint can read from the previous cache.
+        let mut user_count = 0;
+        for message in messages_spec.iter_mut().rev() {
+            if message.get("role") == Some(&json!("user")) {
+                if let Some(content) = message.get_mut("content") {
+                    if let Some(content_str) = content.as_str() {
+                        *content = json!([{
+                            "type": "text",
+                            "text": content_str,
+                            "cache_control": { "type": "ephemeral" }
+                        }]);
+                    }
+                }
+                user_count += 1;
+                if user_count >= 2 {
+                    break;
+                }
+            }
+        }
+
+        // Update the system message to have cache_control field.
+        if let Some(system_message) = messages_spec
+            .iter_mut()
+            .find(|msg| msg.get("role") == Some(&json!("system")))
+        {
+            if let Some(content) = system_message.get_mut("content") {
+                if let Some(content_str) = content.as_str() {
+                    *system_message = json!({
+                        "role": "system",
+                        "content": [{
+                            "type": "text",
+                            "text": content_str,
+                            "cache_control": { "type": "ephemeral" }
+                        }]
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(tools_spec) = payload
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("tools"))
+        .and_then(|tools| tools.as_array_mut())
+    {
+        // Add "cache_control" to the last tool spec, if any. This means that all tool definitions,
+        // will be cached as a single prefix.
+        if let Some(last_tool) = tools_spec.last_mut() {
+            if let Some(function) = last_tool.get_mut("function") {
+                function
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+            }
+        }
+    }
+    payload
+}
+
 pub fn emit_debug_trace<T1, T2>(
     model_config: &ModelConfig,
     payload: &T1,
@@ -480,6 +600,79 @@ pub fn json_escape_control_chars_in_string(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_is_anthropic_model() {
+        assert!(is_anthropic_model("anthropic/claude-3.5-sonnet"));
+        assert!(is_anthropic_model("anthropic-something"));
+        assert!(!is_anthropic_model("google/gemini-pro"));
+        assert!(!is_anthropic_model("openai/gpt-4"));
+        assert!(!is_anthropic_model(""));
+    }
+
+    #[test]
+    fn test_update_request_for_anthropic() {
+        let original = json!({
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant"
+                },
+                {
+                    "role": "user",
+                    "content": "Hello"
+                },
+                {
+                    "role": "user",
+                    "content": "How are you?"
+                }
+            ],
+            "tools": [
+                {
+                    "function": {
+                        "name": "test_function",
+                        "description": "A test function"
+                    }
+                }
+            ]
+        });
+
+        let updated = update_request_for_anthropic(&original);
+
+        // Check system message
+        let system_msg = updated["messages"][0].clone();
+        assert_eq!(system_msg["role"], "system");
+        assert_eq!(
+            system_msg["content"][0]["text"],
+            "You are a helpful assistant"
+        );
+        assert_eq!(
+            system_msg["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // Check last two user messages
+        let last_user_msg = &updated["messages"][2];
+        assert_eq!(last_user_msg["role"], "user");
+        assert_eq!(last_user_msg["content"][0]["text"], "How are you?");
+        assert_eq!(
+            last_user_msg["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        let second_last_user_msg = &updated["messages"][1];
+        assert_eq!(second_last_user_msg["role"], "user");
+        assert_eq!(second_last_user_msg["content"][0]["text"], "Hello");
+        assert_eq!(
+            second_last_user_msg["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // Check tool
+        let tool = &updated["tools"][0]["function"];
+        assert_eq!(tool["name"], "test_function");
+        assert_eq!(tool["cache_control"]["type"], "ephemeral");
+    }
 
     #[test]
     fn test_detect_image_path() {

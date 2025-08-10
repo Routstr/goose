@@ -58,6 +58,29 @@ struct Identifier {
     path: Option<PathBuf>,
 }
 
+#[derive(Subcommand)]
+enum WalletCommand {
+    /// Show current wallet balance
+    #[command(about = "Show current wallet balance")]
+    Balance {},
+
+    /// Top up wallet with a cashu token
+    #[command(about = "Top up wallet with a cashu token")]
+    Topup {
+        /// The cashu token to top up the wallet with
+        #[arg(help = "The cashu token to top up the wallet with")]
+        token: String,
+    },
+
+    /// Withdraw funds from wallet
+    #[command(about = "Withdraw funds from wallet")]
+    Withdraw {
+        /// Amount to withdraw in sats. If not specified, withdraws full balance.
+        #[arg(help = "Amount to withdraw in sats. If not specified, withdraws full balance.")]
+        amount: Option<u64>,
+    },
+}
+
 fn extract_identifier(identifier: Identifier) -> session::Identifier {
     if let Some(name) = identifier.name {
         session::Identifier::Name(name)
@@ -273,6 +296,13 @@ enum Command {
     /// Configure Goose settings
     #[command(about = "Configure Goose settings")]
     Configure {},
+
+    /// Manage wallet operations
+    #[command(about = "Manage wallet operations")]
+    Wallet {
+        #[command(subcommand)]
+        command: WalletCommand,
+    },
 
     /// Display Goose configuration information
     #[command(about = "Display Goose information")]
@@ -713,6 +743,7 @@ pub async fn cli() -> Result<()> {
         Some(Command::Bench { .. }) => "bench",
         Some(Command::Recipe { .. }) => "recipe",
         Some(Command::Web { .. }) => "web",
+        Some(Command::Wallet { .. }) => "wallet",
         None => "default_session",
     };
 
@@ -1132,6 +1163,17 @@ pub async fn cli() -> Result<()> {
             crate::commands::web::handle_web(port, host, open).await?;
             return Ok(());
         }
+        Some(Command::Wallet { command }) => match command {
+            WalletCommand::Balance {} => {
+                crate::commands::wallet::handle_wallet_balance().await?;
+            }
+            WalletCommand::Topup { token } => {
+                crate::commands::wallet::handle_wallet_topup(token).await?;
+            }
+            WalletCommand::Withdraw { amount } => {
+                crate::commands::wallet::handle_wallet_withdraw(amount).await?;
+            }
+        },
         None => {
             return if !Config::global().exists() {
                 let _ = handle_configure().await;
