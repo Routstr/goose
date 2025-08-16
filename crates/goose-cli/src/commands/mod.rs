@@ -6,4 +6,5 @@ pub mod recipe;
 pub mod schedule;
 pub mod session;
 pub mod update;
+pub mod wallet;
 pub mod web;

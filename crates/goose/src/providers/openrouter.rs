@@ -8,7 +8,7 @@ use super::errors::ProviderError;
 use super::retry::ProviderRetry;
 use super::utils::{
     emit_debug_trace, get_model, handle_response_google_compat, handle_response_openai_compat,
-    is_google_model,
+    is_google_model, update_request_for_anthropic,
 };
 use crate::conversation::message::Message;
 use crate::impl_provider_default;
@@ -67,21 +67,19 @@ impl OpenRouterProvider {
             return handle_response_google_compat(response).await;
         }
 
-        // For OpenAI-compatible models, parse the response body to JSON
-        let response_body = handle_response_openai_compat(response)
-            .await
-            .map_err(|e| ProviderError::RequestFailed(format!("Failed to parse response: {e}")))?;
+        // Handle regular OpenAI-compatible responses
+        let response_value = handle_response_openai_compat(response).await?;
 
         let _debug = format!(
             "OpenRouter request with payload: {} and response: {}",
             serde_json::to_string_pretty(payload).unwrap_or_else(|_| "Invalid JSON".to_string()),
-            serde_json::to_string_pretty(&response_body)
+            serde_json::to_string_pretty(&response_value)
                 .unwrap_or_else(|_| "Invalid JSON".to_string())
         );
 
         // OpenRouter can return errors in 200 OK responses, so we have to check for errors explicitly
         // https://openrouter.ai/docs/api-reference/errors
-        if let Some(error_obj) = response_body.get("error") {
+        if let Some(error_obj) = response_value.get("error") {
             // If there's an error object, extract the error message and code
             let error_message = error_obj
                 .get("message")
@@ -97,6 +95,20 @@ impl OpenRouterProvider {
                 ));
             }
 
+            // Check for insufficient balance errors
+            if error_code == 402 || error_message.contains("insufficient_balance") {
+                // Try to extract required sats from error message
+                if let Some(sats_str) = error_message
+                    .split_whitespace()
+                    .find(|word| word.parse::<f64>().is_ok())
+                {
+                    if let Ok(sats) = sats_str.parse::<f64>() {
+                        return Err(ProviderError::InsufficientBalance(sats));
+                    }
+                }
+                return Err(ProviderError::InsufficientBalance(0.0));
+            }
+
             // Return appropriate error based on the OpenRouter error code
             match error_code {
                 401 | 403 => return Err(ProviderError::Authentication(error_message.to_string())),
@@ -106,82 +118,8 @@ impl OpenRouterProvider {
             }
         }
 
-        // No error detected, return the response body
-        Ok(response_body)
+        Ok(response_value)
     }
-}
-
-/// Update the request when using anthropic model.
-/// For anthropic model, we can enable prompt caching to save cost. Since openrouter is the OpenAI compatible
-/// endpoint, we need to modify the open ai request to have anthropic cache control field.
-fn update_request_for_anthropic(original_payload: &Value) -> Value {
-    let mut payload = original_payload.clone();
-
-    if let Some(messages_spec) = payload
-        .as_object_mut()
-        .and_then(|obj| obj.get_mut("messages"))
-        .and_then(|messages| messages.as_array_mut())
-    {
-        // Add "cache_control" to the last and second-to-last "user" messages.
-        // During each turn, we mark the final message with cache_control so the conversation can be
-        // incrementally cached. The second-to-last user message is also marked for caching with the
-        // cache_control parameter, so that this checkpoint can read from the previous cache.
-        let mut user_count = 0;
-        for message in messages_spec.iter_mut().rev() {
-            if message.get("role") == Some(&json!("user")) {
-                if let Some(content) = message.get_mut("content") {
-                    if let Some(content_str) = content.as_str() {
-                        *content = json!([{
-                            "type": "text",
-                            "text": content_str,
-                            "cache_control": { "type": "ephemeral" }
-                        }]);
-                    }
-                }
-                user_count += 1;
-                if user_count >= 2 {
-                    break;
-                }
-            }
-        }
-
-        // Update the system message to have cache_control field.
-        if let Some(system_message) = messages_spec
-            .iter_mut()
-            .find(|msg| msg.get("role") == Some(&json!("system")))
-        {
-            if let Some(content) = system_message.get_mut("content") {
-                if let Some(content_str) = content.as_str() {
-                    *system_message = json!({
-                        "role": "system",
-                        "content": [{
-                            "type": "text",
-                            "text": content_str,
-                            "cache_control": { "type": "ephemeral" }
-                        }]
-                    });
-                }
-            }
-        }
-    }
-
-    if let Some(tools_spec) = payload
-        .as_object_mut()
-        .and_then(|obj| obj.get_mut("tools"))
-        .and_then(|tools| tools.as_array_mut())
-    {
-        // Add "cache_control" to the last tool spec, if any. This means that all tool definitions,
-        // will be cached as a single prefix.
-        if let Some(last_tool) = tools_spec.last_mut() {
-            if let Some(function) = last_tool.get_mut("function") {
-                function
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
-            }
-        }
-    }
-    payload
 }
 
 fn create_request_based_on_model(
@@ -198,6 +136,7 @@ fn create_request_based_on_model(
         &super::utils::ImageFormat::OpenAi,
     )?;
 
+    // Apply anthropic-specific modifications if needed
     if provider.supports_cache_control() {
         payload = update_request_for_anthropic(&payload);
     }
