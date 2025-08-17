@@ -108,7 +108,7 @@ pub fn map_http_error_to_provider_error(
                 "Provider request failed with status: {}. Payload: {:?}", status, payload
             );
 
-            if let Some(payload) = payload {
+            if let Some(ref payload) = payload {
                 // Try to parse as OpenAIErrorResponse first for better error handling
                 if let Ok(err_resp) = from_value::<OpenAIErrorResponse>(payload.clone()) {
                     let err = err_resp.error;
